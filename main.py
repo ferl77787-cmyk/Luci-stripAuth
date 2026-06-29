@@ -1,14 +1,15 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 import requests
 import json
 import random
 import re
 import asyncio
-import threading
 import time
 from fake_useragent import UserAgent
 
 app = Flask(__name__)
+CORS(app)  # Enable CORS for all routes
 
 # ==================== HELPER FUNCTIONS ====================
 
@@ -291,22 +292,20 @@ def home():
     """API Home Page"""
     return jsonify({
         "service": "CC Checker API",
-        "version": "2.0",
+        "version": "3.0",
         "description": "Check single or multiple credit cards",
         "endpoints": {
             "/check": {
+                "method": "GET",
+                "description": "Check single card via query parameter",
+                "example": "/check?cc=4106210007965080|08|2029|130"
+            },
+            "/check": {
                 "method": "POST",
-                "description": "Check single or multiple cards",
+                "description": "Check single or multiple cards via JSON body",
                 "examples": {
-                    "single": {
-                        "card": "4106210007965080|08|2029|130"
-                    },
-                    "bulk": {
-                        "cards": [
-                            "4106210007965080|08|2029|130",
-                            "4111111111111111|12|2025|123"
-                        ]
-                    }
+                    "single": {"card": "4106210007965080|08|2029|130"},
+                    "bulk": {"cards": ["card1", "card2"]}
                 }
             },
             "/health": {
@@ -316,131 +315,169 @@ def home():
         }
     })
 
-@app.route('/check', methods=['POST'])
+@app.route('/check', methods=['GET', 'POST'])
 def check_cards():
     """
-    Unified endpoint for single and bulk card checking
+    Unified endpoint for GET and POST requests
+    GET: /check?cc=card_number|month|year|cvv
+    POST: JSON with card or cards array
     """
-    try:
-        # Get JSON data
-        data = request.get_json()
+    
+    # ============ GET REQUEST ============
+    if request.method == 'GET':
+        cc = request.args.get('cc')
         
-        # Validate request
-        if not data:
+        if not cc:
             return jsonify({
                 "status": "error",
-                "message": "No JSON data provided",
-                "example": {
-                    "card": "4106210007965080|08|2029|130"
-                }
+                "message": "Missing 'cc' parameter",
+                "example": "/check?cc=4106210007965080|08|2029|130",
+                "format": "CARD_NUMBER|MONTH|YEAR|CVV"
             }), 400
         
-        # ============ SINGLE CARD CHECK ============
-        if 'card' in data:
-            card = data['card']
-            
-            # Validate format
-            if not card or "|" not in card or len(card.split("|")) != 4:
-                return jsonify({
-                    "status": "error",
-                    "message": "Invalid card format. Use: number|month|year|cvv",
-                    "example": "4106210007965080|08|2029|130"
-                }), 400
-            
+        # Validate format
+        if "|" not in cc or len(cc.split("|")) != 4:
+            return jsonify({
+                "status": "error",
+                "message": "Invalid card format. Use: number|month|year|cvv",
+                "example": "4106210007965080|08|2029|130",
+                "received": cc
+            }), 400
+        
+        try:
             # Run check
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-            result = loop.run_until_complete(check_cc(card))
+            result = loop.run_until_complete(check_cc(cc))
             loop.close()
             
+            # Return response
             return jsonify({
                 "type": "single",
-                "card": card,
+                "card": cc,
                 "result": result,
                 "timestamp": time.time()
             })
-        
-        # ============ BULK CARDS CHECK ============
-        elif 'cards' in data:
-            cards = data['cards']
             
-            # Validate
-            if not isinstance(cards, list):
+        except Exception as e:
+            return jsonify({
+                "status": "error",
+                "message": f"Server error: {str(e)}"
+            }), 500
+    
+    # ============ POST REQUEST ============
+    elif request.method == 'POST':
+        try:
+            data = request.get_json()
+            
+            if not data:
                 return jsonify({
                     "status": "error",
-                    "message": "cards must be an array"
+                    "message": "No JSON data provided",
+                    "example": {
+                        "card": "4106210007965080|08|2029|130"
+                    }
                 }), 400
             
-            if len(cards) == 0:
-                return jsonify({
-                    "status": "error",
-                    "message": "No cards provided"
-                }), 400
-            
-            if len(cards) > 100:
-                return jsonify({
-                    "status": "error",
-                    "message": "Maximum 100 cards allowed per request"
-                }), 400
-            
-            # Process each card
-            results = []
-            for card in cards:
+            # Single card check
+            if 'card' in data:
+                card = data['card']
+                
                 # Validate format
                 if not card or "|" not in card or len(card.split("|")) != 4:
-                    results.append({
-                        "card": card,
-                        "result": {
-                            "status": "error",
-                            "message": "Invalid format"
-                        }
-                    })
-                    continue
+                    return jsonify({
+                        "status": "error",
+                        "message": "Invalid card format. Use: number|month|year|cvv",
+                        "example": "4106210007965080|08|2029|130"
+                    }), 400
                 
-                # Run check
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 result = loop.run_until_complete(check_cc(card))
                 loop.close()
                 
-                results.append({
+                return jsonify({
+                    "type": "single",
                     "card": card,
-                    "result": result
+                    "result": result,
+                    "timestamp": time.time()
                 })
             
-            # Count statistics
-            approved = sum(1 for r in results if r['result'].get('status') == 'approved')
-            declined = sum(1 for r in results if r['result'].get('status') == 'declined')
-            errors = sum(1 for r in results if r['result'].get('status') == 'error')
+            # Bulk cards check
+            elif 'cards' in data:
+                cards = data['cards']
+                
+                if not isinstance(cards, list):
+                    return jsonify({
+                        "status": "error",
+                        "message": "cards must be an array"
+                    }), 400
+                
+                if len(cards) == 0:
+                    return jsonify({
+                        "status": "error",
+                        "message": "No cards provided"
+                    }), 400
+                
+                if len(cards) > 100:
+                    return jsonify({
+                        "status": "error",
+                        "message": "Maximum 100 cards allowed per request"
+                    }), 400
+                
+                results = []
+                for card in cards:
+                    if not card or "|" not in card or len(card.split("|")) != 4:
+                        results.append({
+                            "card": card,
+                            "result": {
+                                "status": "error",
+                                "message": "Invalid format"
+                            }
+                        })
+                        continue
+                    
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    result = loop.run_until_complete(check_cc(card))
+                    loop.close()
+                    
+                    results.append({
+                        "card": card,
+                        "result": result
+                    })
+                
+                approved = sum(1 for r in results if r['result'].get('status') == 'approved')
+                declined = sum(1 for r in results if r['result'].get('status') == 'declined')
+                errors = sum(1 for r in results if r['result'].get('status') == 'error')
+                
+                return jsonify({
+                    "type": "bulk",
+                    "total": len(cards),
+                    "statistics": {
+                        "approved": approved,
+                        "declined": declined,
+                        "errors": errors
+                    },
+                    "results": results,
+                    "timestamp": time.time()
+                })
             
-            return jsonify({
-                "type": "bulk",
-                "total": len(cards),
-                "statistics": {
-                    "approved": approved,
-                    "declined": declined,
-                    "errors": errors
-                },
-                "results": results,
-                "timestamp": time.time()
-            })
-        
-        # ============ INVALID REQUEST ============
-        else:
+            else:
+                return jsonify({
+                    "status": "error",
+                    "message": "Send 'card' for single or 'cards' array for bulk check",
+                    "examples": {
+                        "single": {"card": "4106210007965080|08|2029|130"},
+                        "bulk": {"cards": ["card1", "card2", "card3"]}
+                    }
+                }), 400
+                
+        except Exception as e:
             return jsonify({
                 "status": "error",
-                "message": "Send 'card' for single or 'cards' array for bulk check",
-                "examples": {
-                    "single": {"card": "4106210007965080|08|2029|130"},
-                    "bulk": {"cards": ["card1", "card2", "card3"]}
-                }
-            }), 400
-            
-    except Exception as e:
-        return jsonify({
-            "status": "error",
-            "message": f"Server error: {str(e)}"
-        }), 500
+                "message": f"Server error: {str(e)}"
+            }), 500
 
 @app.route('/health', methods=['GET'])
 def health_check():
@@ -448,7 +485,7 @@ def health_check():
     return jsonify({
         "status": "healthy",
         "service": "CC Checker API",
-        "version": "2.0",
+        "version": "3.0",
         "timestamp": time.time()
     })
 
@@ -472,15 +509,16 @@ def method_not_allowed(e):
 
 if __name__ == '__main__':
     print("=" * 50)
-    print("🔥 CC Checker API Started")
+    print("🔥 CC Checker API Started (v3.0)")
     print("=" * 50)
     print(f"📍 Server: http://localhost:5000")
-    print(f"📌 Check: POST /check")
-    print(f"📌 Health: GET /health")
-    print("=" * 50)
-    print("\nExamples:")
-    print("  Single: curl -X POST http://localhost:5000/check -H 'Content-Type: application/json' -d '{\"card\":\"4106210007965080|08|2029|130\"}'")
-    print("  Bulk:   curl -X POST http://localhost:5000/check -H 'Content-Type: application/json' -d '{\"cards\":[\"card1\",\"card2\"]}'")
+    print(f"\n📌 GET Examples:")
+    print(f"   http://localhost:5000/check?cc=4106210007965080|08|2029|130")
+    print(f"   http://localhost:5000/check?cc=5457568279494119|07|2026|260")
+    print(f"\n📌 POST Examples:")
+    print(f"   Single: POST /check with {{'card': '...'}}")
+    print(f"   Bulk:   POST /check with {{'cards': [...]}}")
+    print(f"\n📌 Health: GET /health")
     print("=" * 50)
     
     app.run(host='0.0.0.0', port=5000, debug=True, threaded=True)
