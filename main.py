@@ -1,5 +1,4 @@
 from flask import Flask, request, jsonify
-from flask_cors import CORS
 import asyncio
 import re
 import json
@@ -9,13 +8,14 @@ from datetime import datetime
 import uuid
 import warnings
 from fake_useragent import UserAgent
-
-app = Flask(__name__)
-CORS(app)
+from colorama import init, Fore, Style
 
 warnings.filterwarnings('ignore')
+init(autoreset=True)
 
-# ==================== HELPER FUNCTIONS ====================
+app = Flask(__name__)
+
+# ────────────────────────── helper functions ──────────────────────────
 
 def gets(s, start, end):
     try:
@@ -35,7 +35,46 @@ def generate_random_email():
 def generate_guid():
     return str(uuid.uuid4())
 
-# ==================== MAIN CHECK FUNCTION ====================
+def parse_proxy_line(line: str) -> str or None:
+    line = line.strip()
+    if not line:
+        return None
+    protocol = 'http'
+    if '://' in line:
+        protocol, rest = line.split('://', 1)
+    else:
+        rest = line
+    auth = None
+    address = None
+    if '@' in rest:
+        left, right = rest.split('@', 1)
+        if ':' in left and ':' not in right:
+            auth = left
+            address = right
+        elif ':' in right and ':' not in left:
+            address = left
+            auth = right
+        else:
+            auth = left
+            address = right
+    else:
+        parts = rest.split(':')
+        if len(parts) == 2:
+            host, port = parts
+            address = f"{host}:{port}"
+        elif len(parts) == 4:
+            host, port, user, pwd = parts
+            auth = f"{user}:{pwd}"
+            address = f"{host}:{port}"
+        else:
+            return None
+    if auth:
+        proxy_url = f"{protocol}://{auth}@{address}"
+    else:
+        proxy_url = f"{protocol}://{address}"
+    return proxy_url
+
+# ──────────────────────── stripe auth logic ──────────────────────────
 
 async def process_stripe_card(card_data, proxy_url=None):
     ua = UserAgent()
@@ -195,12 +234,12 @@ async def process_stripe_card(card_data, proxy_url=None):
     except Exception as e:
         return False, f'System Error: {str(e)}'
 
+# ─────────────────────── single card check ───────────────────────────
+
 async def check_card(cc, mes, ano, cvv, proxy=None):
     card_data = {'number': cc, 'exp_month': mes, 'exp_year': ano, 'cvc': cvv}
     is_approved, response_msg = await process_stripe_card(card_data, proxy_url=proxy)
-    
     response_lower = response_msg.lower()
-    
     if 'requires_action' in response_lower or 'succeeded' in response_lower:
         status = 'Approved'
         is_live = True
@@ -210,7 +249,6 @@ async def check_card(cc, mes, ano, cvv, proxy=None):
     else:
         status = 'Declined'
         is_live = False
-    
     return {
         'cc': f"{cc}|{mes}|{ano}|{cvv}",
         'status': status,
@@ -218,88 +256,86 @@ async def check_card(cc, mes, ano, cvv, proxy=None):
         'is_live': is_live
     }
 
-# ==================== FLASK API ENDPOINTS ====================
+# ──────────────────────── API Routes ──────────────────────────────
 
-@app.route('/', methods=['GET'])
-def home():
-    return jsonify({
-        "service": "Stripe CC Checker API",
-        "version": "1.0",
-        "endpoints": {
-            "/check": {
-                "method": "GET",
-                "example": "/check?cc=4106210007965080|08|2029|130"
-            },
-            "/health": {
-                "method": "GET",
-                "description": "Health check"
-            }
-        }
-    })
-
-@app.route('/check', methods=['GET'])
-def check_cards():
+@app.route('/check/', methods=['GET'])
+async def check_card_api():
     """
-    GET: /check?cc=4106210007965080|08|2029|130
+    API endpoint to check a single card
+    Usage: /check/?cc=5129925506260283|02|2028|384&proxy=http://user:pass@proxy:port
     """
-    cc = request.args.get('cc')
+    # Get parameters
+    cc_param = request.args.get('cc')
+    proxy_param = request.args.get('proxy', '')
     
-    if not cc:
+    if not cc_param:
         return jsonify({
-            "status": "error",
-            "message": "Missing 'cc' parameter",
-            "example": "/check?cc=4106210007965080|08|2029|130"
+            'success': False,
+            'error': 'Missing cc parameter',
+            'usage': '/check/?cc=cardnumber|month|year|cvv&proxy=proxy_url'
         }), 400
     
-    parts = cc.split('|')
+    # Parse card details
+    parts = cc_param.split('|')
     if len(parts) != 4:
         return jsonify({
-            "status": "error",
-            "message": "Invalid format. Use: number|month|year|cvv",
-            "example": "4106210007965080|08|2029|130"
+            'success': False,
+            'error': 'Invalid card format. Use: number|month|year|cvv'
         }), 400
     
+    cc, mes, ano, cvv = parts
+    
+    # Validate proxy if provided
+    proxy = None
+    if proxy_param and proxy_param.strip():
+        proxy = parse_proxy_line(proxy_param)
+        if not proxy:
+            return jsonify({
+                'success': False,
+                'error': 'Invalid proxy format'
+            }), 400
+    
     try:
-        cc_num, mes, ano, cvv = parts
-        
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        result = loop.run_until_complete(check_card(cc_num, mes, ano, cvv))
-        loop.close()
+        # Check the card
+        result = await check_card(cc, mes, ano, cvv, proxy=proxy)
         
         return jsonify({
-            "card": result['cc'],
-            "status": result['status'],
-            "response": result['response'],
-            "is_live": result['is_live'],
-            "timestamp": datetime.now().isoformat()
+            'success': True,
+            'card': result['cc'],
+            'status': result['status'],
+            'response': result['response'],
+            'is_live': result['is_live']
         })
         
     except Exception as e:
         return jsonify({
-            "status": "error",
-            "message": str(e)
+            'success': False,
+            'error': f'System error: {str(e)}'
         }), 500
 
 @app.route('/health', methods=['GET'])
 def health_check():
+    """Health check endpoint"""
     return jsonify({
-        "status": "healthy",
-        "timestamp": datetime.now().isoformat()
+        'status': 'running',
+        'message': 'Stripe Card Checker API is operational'
     })
 
-@app.errorhandler(404)
-def not_found(e):
+@app.route('/', methods=['GET'])
+def index():
+    """API information"""
     return jsonify({
-        "status": "error",
-        "message": "Endpoint not found"
-    }), 404
+        'name': 'Stripe Card Checker API',
+        'version': '1.0',
+        'endpoints': {
+            '/check/': 'Check a single card. Parameters: cc (required), proxy (optional)',
+            '/health': 'Check API health status'
+        },
+        'example': '/check/?cc=5129925506260283|02|2028|384&proxy=http://user:pass@proxy:port'
+    })
 
-if __name__ == '__main__':
-    print("=" * 50)
-    print("Stripe CC Checker API")
-    print("=" * 50)
-    print("GET: /check?cc=4106210007965080|08|2029|130")
-    print("GET: /health")
-    print("=" * 50)
+# ──────────────────────── Main entry point ──────────────────────────
+
+if __name__ == "__main__":
+    # Run the Flask app
     app.run(host='0.0.0.0', port=5000, debug=True)
