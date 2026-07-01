@@ -98,7 +98,7 @@ class BravehoundDonationBot:
             
         self.card_number = parts[0].strip()
         self.exp_month = parts[1].strip()
-        self.exp_year = parts[2].strip()
+        self.exp_year = parts[2].strip()  # Keep as string
         self.cvc = parts[3].strip()
         
         self.session = requests.Session()
@@ -143,20 +143,20 @@ class BravehoundDonationBot:
     def create_payment_method(self):
         url = "https://api.stripe.com/v1/payment_methods"
         
-        # Fix: Convert exp_year to string and get last 2 digits safely
-        exp_year_str = str(self.exp_year)
-        if len(exp_year_str) > 2:
+        # Fix: Ensure exp_year is string and get last 2 digits
+        exp_year_str = str(self.exp_year).strip()
+        if len(exp_year_str) >= 2:
             exp_year_last2 = exp_year_str[-2:]
         else:
-            exp_year_last2 = exp_year_str
+            exp_year_last2 = exp_year_str.zfill(2)
         
         payload = {
             'type': "card",
             'billing_details[name]': f"{self.address['first_name']} {self.address['last_name']}",
             'billing_details[email]': self.address['email'],
-            'card[number]': self.card_number,
-            'card[cvc]': self.cvc,
-            'card[exp_month]': self.exp_month,
+            'card[number]': str(self.card_number).strip(),
+            'card[cvc]': str(self.cvc).strip(),
+            'card[exp_month]': str(self.exp_month).strip(),
             'card[exp_year]': exp_year_last2,
             'guid': "c2d15411-4ea6-4412-96f9-5964b19feacc9a03e0",
             'muid': "2cbebced-2e78-43c8-8df0-d77c88f32d7effd1d6",
@@ -185,14 +185,15 @@ class BravehoundDonationBot:
             'accept-language': "en-IN,en;q=0.9,bn-IN;q=0.8,bn;q=0.7,en-GB;q=0.6,en-US;q=0.5",
             'priority': "u=1, i"
         }
-        response = self.session.post(url, data=payload, headers=headers)
         
-        # Check if response is valid
-        if response.status_code != 200:
-            raise Exception(f"Stripe API error: {response.text}")
-        
-        self.payment_method_id = response.json()['id']
-        return self.payment_method_id
+        try:
+            response = self.session.post(url, data=payload, headers=headers)
+            response.raise_for_status()
+            result = response.json()
+            self.payment_method_id = result['id']
+            return self.payment_method_id
+        except Exception as e:
+            raise Exception(f"Stripe payment method creation failed: {str(e)}")
     
     def submit_donation(self):
         url = "https://www.bravehound.co.uk/donation/"
