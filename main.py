@@ -45,6 +45,51 @@ class USAddressGenerator:
             "email": f"{random.choice(cls.FIRST_NAMES).lower()}{random.randint(1, 999)}@gmail.com"
         }
 
+def format_proxy(proxy: str) -> str:
+    """
+    Support all proxy formats:
+    1. http://user:pass@ip:port
+    2. https://user:pass@ip:port
+    3. user:pass@ip:port
+    4. ip:port:user:pass
+    5. ip:port
+    6. user:pass@host:port
+    """
+    if not proxy:
+        return None
+    
+    proxy = proxy.strip()
+    
+    # Already has http:// or https://
+    if proxy.startswith('http://') or proxy.startswith('https://'):
+        return proxy
+    
+    # Format: user:pass@ip:port
+    if '@' in proxy and ':' in proxy.split('@')[0]:
+        return f"http://{proxy}"
+    
+    # Format: ip:port:user:pass
+    parts = proxy.split(':')
+    if len(parts) == 4:
+        ip, port, user, password = parts
+        # Check if ip contains dots (IPv4) or colons (IPv6)
+        if '.' in ip or ':' in ip:
+            return f"http://{user}:{password}@{ip}:{port}"
+        else:
+            # Maybe format is user:pass:ip:port
+            return f"http://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}"
+    
+    # Format: ip:port (no auth)
+    if len(parts) == 2:
+        return f"http://{proxy}"
+    
+    # Format: user:pass@host (no port)
+    if '@' in proxy:
+        return f"http://{proxy}"
+    
+    # Default: return as is
+    return f"http://{proxy}"
+
 class BravehoundDonationBot:
     def __init__(self, card_data: str, proxy: Optional[str] = None):
         parts = card_data.split('|')
@@ -59,11 +104,13 @@ class BravehoundDonationBot:
         self.session = requests.Session()
         
         if proxy:
-            proxy_dict = {
-                'http': proxy,
-                'https': proxy
-            }
-            self.session.proxies.update(proxy_dict)
+            formatted_proxy = format_proxy(proxy)
+            if formatted_proxy:
+                proxy_dict = {
+                    'http': formatted_proxy,
+                    'https': formatted_proxy
+                }
+                self.session.proxies.update(proxy_dict)
         
         self.address = USAddressGenerator.generate_address()
         self.form_hash = None
@@ -246,7 +293,11 @@ def bravehound_checker():
     Check credit card with Bravehound donation
     GET Parameters:
         - cc: Required. Format: CC|MM|YYYY|CVV
-        - proxy: Optional. Proxy string (e.g., http://user:pass@ip:port)
+        - proxy: Optional. Supports all formats:
+            * http://user:pass@ip:port
+            * user:pass@ip:port
+            * ip:port:user:pass
+            * ip:port
     """
     try:
         cc_string = request.args.get('cc')
