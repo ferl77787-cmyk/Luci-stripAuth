@@ -4,7 +4,6 @@ import random
 import re
 import os
 import time
-import traceback
 from flask import Flask, request, jsonify
 from typing import Dict, Optional
 
@@ -80,10 +79,10 @@ class BravehoundDonationBot:
         if len(parts) != 4:
             raise ValueError("Invalid card format. Expected: number|month|year|cvc")
             
-        self.card_number = str(parts[0].strip())
-        self.exp_month = str(parts[1].strip())
-        self.exp_year = str(parts[2].strip())
-        self.cvc = str(parts[3].strip())
+        self.card_number = parts[0].strip()
+        self.exp_month = parts[1].strip()
+        self.exp_year = parts[2].strip()
+        self.cvc = parts[3].strip()
         
         self.session = requests.Session()
         
@@ -121,17 +120,21 @@ class BravehoundDonationBot:
             'priority': "u=1, i",
         }
         response = self.session.post(url, data=payload, headers=headers)
-        data = response.json()
-        self.form_hash = data['data']['give_form_hash']
+        response_data = response.json()
+        self.form_hash = response_data.get('data', {}).get('give_form_hash')
+        if not self.form_hash:
+            raise Exception("Failed to get form hash")
         return self.form_hash
     
     def create_payment_method(self):
         url = "https://api.stripe.com/v1/payment_methods"
         
-        # Properly format exp_year - get last 2 digits
-        exp_year_str = self.exp_year.strip()
-        if len(exp_year_str) >= 2:
-            exp_year = exp_year_str[-2:]
+        # Get last 2 digits of year
+        exp_year_str = str(self.exp_year)
+        if len(exp_year_str) == 4:
+            exp_year = exp_year_str[2:4]
+        elif len(exp_year_str) == 2:
+            exp_year = exp_year_str
         else:
             exp_year = exp_year_str.zfill(2)
         
@@ -173,18 +176,21 @@ class BravehoundDonationBot:
         
         response = self.session.post(url, data=payload, headers=headers)
         
-        # Check if response is valid JSON
+        # CRITICAL FIX: Check if response is JSON or not
         try:
             result = response.json()
-        except Exception as e:
-            raise Exception(f"Stripe returned invalid JSON: {response.text[:200]}")
+        except:
+            # Agar JSON nahi hai toh raw text return karo
+            raise Exception(f"Stripe returned non-JSON response: {response.text[:200]}")
         
-        # Check for errors in response
+        # Check for Stripe error
         if 'error' in result:
-            raise Exception(f"Stripe error: {result['error'].get('message', 'Unknown error')}")
+            error_msg = result['error'].get('message', 'Unknown Stripe error')
+            raise Exception(f"Stripe Error: {error_msg}")
         
+        # Get payment method ID
         if 'id' not in result:
-            raise Exception(f"Missing payment method ID in response: {result}")
+            raise Exception(f"No payment method ID in response: {result}")
         
         self.payment_method_id = result['id']
         return self.payment_method_id
@@ -251,32 +257,31 @@ class BravehoundDonationBot:
         return self._parse_response(response.text)
     
     def _parse_response(self, response_text):
-        # Check for errors in response
+        # Card declined checks
         if 'card_declined' in response_text.lower():
             return {"status": "declined", "message": "Card declined"}
         
-        if 'insufficient_funds' in response_text.lower():
+        if 'insufficient_funds' in response_text.lower() or 'insufficient' in response_text.lower():
             return {"status": "declined", "message": "Insufficient funds"}
         
+        # Error message
         error_match = re.search(r'<p>.*?<strong>Error</strong>:(.*?)<br', response_text, re.DOTALL)
         if error_match:
             error_msg = error_match.group(1).strip()
             return {"status": "error", "message": error_msg}
         
-        # Check for success
-        success_patterns = ['thank you', 'successfully', 'succeeded', 'your donation was successful', 'donation confirmed']
-        for pattern in success_patterns:
-            if re.search(pattern, response_text, re.I):
-                return {"status": "success", "message": "Charged $1.00 successfully"}
+        # Success messages
+        if re.search(r'(thank\s?you|successfully|succeeded|donation confirmed|your donation was successful)', response_text, re.I):
+            return {"status": "success", "message": "Charged $1.00 successfully"}
         
         return {"status": "unknown", "message": "Unknown Response"}
     
     def run(self):
         try:
             self.get_form_hash()
-            time.sleep(random.uniform(0.5, 2))
+            time.sleep(random.uniform(0.5, 1.5))
             self.create_payment_method()
-            time.sleep(random.uniform(0.5, 2))
+            time.sleep(random.uniform(0.5, 1.5))
             result = self.submit_donation()
             result["card"] = self.card_number
             result["address"] = f"{self.address['address']}, {self.address['city']}, {self.address['state']} {self.address['zip']}"
