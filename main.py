@@ -120,19 +120,24 @@ class BravehoundDonationBot:
             'priority': "u=1, i",
         }
         response = self.session.post(url, data=payload, headers=headers)
-        response_data = response.json()
-        self.form_hash = response_data.get('data', {}).get('give_form_hash')
+        
+        try:
+            data = response.json()
+            self.form_hash = data.get('data', {}).get('give_form_hash')
+        except:
+            raise Exception("Failed to parse form hash response")
+            
         if not self.form_hash:
-            raise Exception("Failed to get form hash")
+            raise Exception("Form hash not found in response")
         return self.form_hash
     
     def create_payment_method(self):
         url = "https://api.stripe.com/v1/payment_methods"
         
-        # Get last 2 digits of year
-        exp_year_str = str(self.exp_year)
+        # Handle year properly
+        exp_year_str = str(self.exp_year).strip()
         if len(exp_year_str) == 4:
-            exp_year = exp_year_str[2:4]
+            exp_year = exp_year_str[-2:]
         elif len(exp_year_str) == 2:
             exp_year = exp_year_str
         else:
@@ -142,9 +147,9 @@ class BravehoundDonationBot:
             'type': "card",
             'billing_details[name]': f"{self.address['first_name']} {self.address['last_name']}",
             'billing_details[email]': self.address['email'],
-            'card[number]': self.card_number,
-            'card[cvc]': self.cvc,
-            'card[exp_month]': self.exp_month,
+            'card[number]': str(self.card_number),
+            'card[cvc]': str(self.cvc),
+            'card[exp_month]': str(self.exp_month),
             'card[exp_year]': exp_year,
             'guid': "c2d15411-4ea6-4412-96f9-5964b19feacc9a03e0",
             'muid': "2cbebced-2e78-43c8-8df0-d77c88f32d7effd1d6",
@@ -176,21 +181,24 @@ class BravehoundDonationBot:
         
         response = self.session.post(url, data=payload, headers=headers)
         
-        # CRITICAL FIX: Check if response is JSON or not
+        # CRITICAL FIX: Safely parse response
         try:
             result = response.json()
-        except:
-            # Agar JSON nahi hai toh raw text return karo
-            raise Exception(f"Stripe returned non-JSON response: {response.text[:200]}")
+        except Exception as e:
+            raise Exception(f"Stripe response is not JSON: {response.text[:200]}")
+        
+        # Check if result is dictionary or not
+        if not isinstance(result, dict):
+            raise Exception(f"Stripe returned unexpected type: {type(result)} - {result}")
         
         # Check for Stripe error
-        if 'error' in result:
+        if 'error' in result and isinstance(result['error'], dict):
             error_msg = result['error'].get('message', 'Unknown Stripe error')
             raise Exception(f"Stripe Error: {error_msg}")
         
         # Get payment method ID
         if 'id' not in result:
-            raise Exception(f"No payment method ID in response: {result}")
+            raise Exception(f"No payment method ID in response")
         
         self.payment_method_id = result['id']
         return self.payment_method_id
