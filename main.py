@@ -85,6 +85,9 @@ class BravehoundDonationBot:
         self.cvc = parts[3].strip()
         
         self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        })
         
         if proxy:
             formatted_proxy = format_proxy(proxy)
@@ -119,17 +122,40 @@ class BravehoundDonationBot:
             'accept-language': "en-IN,en;q=0.9,bn-IN;q=0.8,bn;q=0.7,en-GB;q=0.6,en-US;q=0.5",
             'priority': "u=1, i",
         }
-        response = self.session.post(url, data=payload, headers=headers)
         
         try:
-            data = response.json()
-            self.form_hash = data.get('data', {}).get('give_form_hash')
-        except:
-            raise Exception("Failed to parse form hash response")
+            response = self.session.post(url, data=payload, headers=headers, timeout=30)
             
-        if not self.form_hash:
-            raise Exception("Form hash not found in response")
-        return self.form_hash
+            # Check status code
+            if response.status_code != 200:
+                raise Exception(f"HTTP {response.status_code}: {response.text[:100]}")
+            
+            # Parse JSON
+            try:
+                data = response.json()
+            except json.JSONDecodeError:
+                raise Exception(f"Invalid JSON response: {response.text[:200]}")
+            
+            # Check if data is dict
+            if not isinstance(data, dict):
+                raise Exception(f"Unexpected response type: {type(data)}")
+            
+            # Check for success
+            if data.get('success') != True:
+                raise Exception(f"API returned error: {data.get('data', {}).get('message', 'Unknown error')}")
+            
+            # Get form hash
+            form_hash = data.get('data', {}).get('give_form_hash')
+            if not form_hash:
+                raise Exception("Form hash not found in response")
+            
+            self.form_hash = form_hash
+            return self.form_hash
+            
+        except requests.exceptions.RequestException as e:
+            raise Exception(f"Network error: {str(e)}")
+        except Exception as e:
+            raise Exception(f"Failed to get form hash: {str(e)}")
     
     def create_payment_method(self):
         url = "https://api.stripe.com/v1/payment_methods"
@@ -179,29 +205,34 @@ class BravehoundDonationBot:
             'priority': "u=1, i"
         }
         
-        response = self.session.post(url, data=payload, headers=headers)
-        
-        # CRITICAL FIX: Safely parse response
         try:
-            result = response.json()
+            response = self.session.post(url, data=payload, headers=headers, timeout=30)
+            
+            if response.status_code != 200:
+                raise Exception(f"Stripe API HTTP {response.status_code}: {response.text[:200]}")
+            
+            try:
+                result = response.json()
+            except json.JSONDecodeError:
+                raise Exception(f"Stripe returned invalid JSON: {response.text[:200]}")
+            
+            if not isinstance(result, dict):
+                raise Exception(f"Stripe returned unexpected type: {type(result)}")
+            
+            if 'error' in result:
+                error_msg = result['error'].get('message', 'Unknown error')
+                raise Exception(f"Stripe error: {error_msg}")
+            
+            if 'id' not in result:
+                raise Exception(f"No payment method ID in response")
+            
+            self.payment_method_id = result['id']
+            return self.payment_method_id
+            
+        except requests.exceptions.RequestException as e:
+            raise Exception(f"Network error: {str(e)}")
         except Exception as e:
-            raise Exception(f"Stripe response is not JSON: {response.text[:200]}")
-        
-        # Check if result is dictionary or not
-        if not isinstance(result, dict):
-            raise Exception(f"Stripe returned unexpected type: {type(result)} - {result}")
-        
-        # Check for Stripe error
-        if 'error' in result and isinstance(result['error'], dict):
-            error_msg = result['error'].get('message', 'Unknown Stripe error')
-            raise Exception(f"Stripe Error: {error_msg}")
-        
-        # Get payment method ID
-        if 'id' not in result:
-            raise Exception(f"No payment method ID in response")
-        
-        self.payment_method_id = result['id']
-        return self.payment_method_id
+            raise Exception(f"Payment method creation failed: {str(e)}")
     
     def submit_donation(self):
         url = "https://www.bravehound.co.uk/donation/"
@@ -261,8 +292,12 @@ class BravehoundDonationBot:
             'accept-language': "en-IN,en;q=0.9,bn-IN;q=0.8,bn;q=0.7,en-GB;q=0.6,en-US;q=0.5",
             'priority': "u=0, i",
         }
-        response = self.session.post(url, params=params, data=payload, headers=headers)
-        return self._parse_response(response.text)
+        
+        try:
+            response = self.session.post(url, params=params, data=payload, headers=headers, timeout=30)
+            return self._parse_response(response.text)
+        except requests.exceptions.RequestException as e:
+            return {"status": "error", "message": f"Network error: {str(e)}"}
     
     def _parse_response(self, response_text):
         # Card declined checks
