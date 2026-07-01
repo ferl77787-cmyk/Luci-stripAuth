@@ -8,10 +8,8 @@ from datetime import datetime
 import uuid
 import warnings
 from fake_useragent import UserAgent
-from colorama import init, Fore, Style
 
 warnings.filterwarnings('ignore')
-init(autoreset=True)
 
 app = Flask(__name__)
 
@@ -256,62 +254,210 @@ async def check_card(cc, mes, ano, cvv, proxy=None):
         'is_live': is_live
     }
 
-# ──────────────────────── API Routes ──────────────────────────────
+# ──────────────────────── Helper to run async code ──────────────────────────
 
-@app.route('/check/', methods=['GET'])
-async def check_card_api():
+def run_async(coro):
+    """Run async coroutine in a new event loop"""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+
+# ──────────────────────── Single API Endpoint ──────────────────────────────
+
+@app.route('/check/', methods=['GET', 'POST'])
+def check_api():
     """
-    API endpoint to check a single card
-    Usage: /check/?cc=5129925506260283|02|2028|384&proxy=http://user:pass@proxy:port
+    Single endpoint for both single and mass card checking
+    GET: Single card check
+    POST: Single or mass card check
+    
+    GET: /check/?cc=5129925506260283|02|2028|384&proxy=http://user:pass@proxy:port
+    
+    POST: 
+    {
+        "cards": [
+            "5129925506260283|02|2028|384",
+            "4111111111111111|12|2026|123"
+        ],
+        "proxy": "http://user:pass@proxy:port",
+        "concurrency": 10
+    }
     """
-    # Get parameters
-    cc_param = request.args.get('cc')
-    proxy_param = request.args.get('proxy', '')
     
-    if not cc_param:
-        return jsonify({
-            'success': False,
-            'error': 'Missing cc parameter',
-            'usage': '/check/?cc=cardnumber|month|year|cvv&proxy=proxy_url'
-        }), 400
-    
-    # Parse card details
-    parts = cc_param.split('|')
-    if len(parts) != 4:
-        return jsonify({
-            'success': False,
-            'error': 'Invalid card format. Use: number|month|year|cvv'
-        }), 400
-    
-    cc, mes, ano, cvv = parts
-    
-    # Validate proxy if provided
-    proxy = None
-    if proxy_param and proxy_param.strip():
-        proxy = parse_proxy_line(proxy_param)
-        if not proxy:
+    # ────── GET Request - Single Card ──────
+    if request.method == 'GET':
+        cc_param = request.args.get('cc')
+        proxy_param = request.args.get('proxy', '')
+        
+        if not cc_param:
             return jsonify({
                 'success': False,
-                'error': 'Invalid proxy format'
+                'error': 'Missing cc parameter',
+                'format': '/check/?cc=cardnumber|month|year|cvv&proxy=proxy_url'
             }), 400
+        
+        parts = cc_param.split('|')
+        if len(parts) != 4:
+            return jsonify({
+                'success': False,
+                'error': 'Invalid card format. Use: number|month|year|cvv'
+            }), 400
+        
+        cc, mes, ano, cvv = parts
+        
+        proxy = None
+        if proxy_param and proxy_param.strip():
+            proxy = parse_proxy_line(proxy_param)
+            if not proxy:
+                return jsonify({
+                    'success': False,
+                    'error': 'Invalid proxy format'
+                }), 400
+        
+        try:
+            result = run_async(check_card(cc, mes, ano, cvv, proxy=proxy))
+            return jsonify({
+                'success': True,
+                'type': 'single',
+                'card': result['cc'],
+                'status': result['status'],
+                'response': result['response'],
+                'is_live': result['is_live']
+            })
+        except Exception as e:
+            return jsonify({
+                'success': False,
+                'error': f'System error: {str(e)}'
+            }), 500
     
-    try:
-        # Check the card
-        result = await check_card(cc, mes, ano, cvv, proxy=proxy)
+    # ────── POST Request - Single or Mass ──────
+    else:
+        data = request.get_json()
+        if not data:
+            return jsonify({
+                'success': False,
+                'error': 'Missing JSON body'
+            }), 400
         
-        return jsonify({
-            'success': True,
-            'card': result['cc'],
-            'status': result['status'],
-            'response': result['response'],
-            'is_live': result['is_live']
-        })
+        cards_data = data.get('cards')
+        proxy_param = data.get('proxy', '')
+        concurrency_param = data.get('concurrency', 10)
         
-    except Exception as e:
-        return jsonify({
-            'success': False,
-            'error': f'System error: {str(e)}'
-        }), 500
+        # If single card provided as string
+        if isinstance(cards_data, str):
+            cards_data = [cards_data]
+        
+        if not cards_data:
+            return jsonify({
+                'success': False,
+                'error': 'Missing cards array in JSON',
+                'format': {
+                    'cards': ['cardnumber|month|year|cvv', 'cardnumber|month|year|cvv'],
+                    'proxy': 'http://user:pass@proxy:port (optional)',
+                    'concurrency': 10
+                }
+            }), 400
+        
+        # Parse cards
+        cards = []
+        for card in cards_data:
+            if isinstance(card, str):
+                parts = card.split('|')
+                if len(parts) == 4:
+                    cards.append({
+                        'cc': parts[0],
+                        'mes': parts[1],
+                        'ano': parts[2],
+                        'cvv': parts[3]
+                    })
+            elif isinstance(card, dict):
+                if all(k in card for k in ['cc', 'mes', 'ano', 'cvv']):
+                    cards.append(card)
+        
+        if not cards:
+            return jsonify({
+                'success': False,
+                'error': 'No valid cards found'
+            }), 400
+        
+        # Parse concurrency
+        try:
+            concurrency = int(concurrency_param)
+            concurrency = min(concurrency, 50)
+        except:
+            concurrency = 10
+        
+        # Parse proxy
+        proxy = None
+        if proxy_param and proxy_param.strip():
+            proxy = parse_proxy_line(proxy_param)
+            if not proxy:
+                return jsonify({
+                    'success': False,
+                    'error': 'Invalid proxy format'
+                }), 400
+        
+        try:
+            # If only one card, return single format
+            if len(cards) == 1:
+                result = run_async(check_card(
+                    cards[0]['cc'], 
+                    cards[0]['mes'], 
+                    cards[0]['ano'], 
+                    cards[0]['cvv'], 
+                    proxy=proxy
+                ))
+                return jsonify({
+                    'success': True,
+                    'type': 'single',
+                    'card': result['cc'],
+                    'status': result['status'],
+                    'response': result['response'],
+                    'is_live': result['is_live']
+                })
+            
+            # Mass check
+            async def mass_check_async():
+                sem = asyncio.Semaphore(concurrency)
+                results = []
+                
+                async def worker(card_data):
+                    async with sem:
+                        result = await check_card(
+                            card_data['cc'], 
+                            card_data['mes'], 
+                            card_data['ano'], 
+                            card_data['cvv'], 
+                            proxy=proxy
+                        )
+                        return result
+                
+                tasks = [asyncio.create_task(worker(card)) for card in cards]
+                results = await asyncio.gather(*tasks)
+                return results
+            
+            results = run_async(mass_check_async())
+            
+            approved = sum(1 for r in results if r['is_live'])
+            declined = sum(1 for r in results if not r['is_live'])
+            
+            return jsonify({
+                'success': True,
+                'type': 'mass',
+                'total': len(results),
+                'approved': approved,
+                'declined': declined,
+                'results': results
+            })
+            
+        except Exception as e:
+            return jsonify({
+                'success': False,
+                'error': f'System error: {str(e)}'
+            }), 500
 
 @app.route('/health', methods=['GET'])
 def health_check():
@@ -326,16 +472,33 @@ def index():
     """API information"""
     return jsonify({
         'name': 'Stripe Card Checker API',
-        'version': '1.0',
-        'endpoints': {
-            '/check/': 'Check a single card. Parameters: cc (required), proxy (optional)',
-            '/health': 'Check API health status'
-        },
-        'example': '/check/?cc=5129925506260283|02|2028|384&proxy=http://user:pass@proxy:port'
+        'version': '3.0',
+        'endpoint': '/check/',
+        'methods': ['GET', 'POST'],
+        'usage': {
+            'GET': {
+                'params': {
+                    'cc': 'cardnumber|month|year|cvv (required)',
+                    'proxy': 'http://user:pass@proxy:port (optional)'
+                },
+                'example': '/check/?cc=5129925506260283|02|2028|384&proxy=http://user:pass@proxy:8080'
+            },
+            'POST': {
+                'body': {
+                    'cards': 'array of cards (required)',
+                    'proxy': 'http://user:pass@proxy:port (optional)',
+                    'concurrency': 'integer, default 10 (optional)'
+                },
+                'example': {
+                    'cards': ['5129925506260283|02|2028|384', '4111111111111111|12|2026|123'],
+                    'proxy': 'http://user:pass@proxy:8080',
+                    'concurrency': 10
+                }
+            }
+        }
     })
 
 # ──────────────────────── Main entry point ──────────────────────────
 
 if __name__ == "__main__":
-    # Run the Flask app
     app.run(host='0.0.0.0', port=5000, debug=True)
