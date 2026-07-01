@@ -142,6 +142,14 @@ class BravehoundDonationBot:
     
     def create_payment_method(self):
         url = "https://api.stripe.com/v1/payment_methods"
+        
+        # Fix: Convert exp_year to string and get last 2 digits safely
+        exp_year_str = str(self.exp_year)
+        if len(exp_year_str) > 2:
+            exp_year_last2 = exp_year_str[-2:]
+        else:
+            exp_year_last2 = exp_year_str
+        
         payload = {
             'type': "card",
             'billing_details[name]': f"{self.address['first_name']} {self.address['last_name']}",
@@ -149,7 +157,7 @@ class BravehoundDonationBot:
             'card[number]': self.card_number,
             'card[cvc]': self.cvc,
             'card[exp_month]': self.exp_month,
-            'card[exp_year]': self.exp_year[-2:] if len(self.exp_year) > 2 else self.exp_year,
+            'card[exp_year]': exp_year_last2,
             'guid': "c2d15411-4ea6-4412-96f9-5964b19feacc9a03e0",
             'muid': "2cbebced-2e78-43c8-8df0-d77c88f32d7effd1d6",
             'sid': "515d1b26-d906-4b1d-a218-e9cb37dbceebeed15b",
@@ -178,6 +186,11 @@ class BravehoundDonationBot:
             'priority': "u=1, i"
         }
         response = self.session.post(url, data=payload, headers=headers)
+        
+        # Check if response is valid
+        if response.status_code != 200:
+            raise Exception(f"Stripe API error: {response.text}")
+        
         self.payment_method_id = response.json()['id']
         return self.payment_method_id
     
